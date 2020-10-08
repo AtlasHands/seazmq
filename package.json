@@ -1,0 +1,23 @@
+{
+  "name": "seazmq",
+  "version": "0.0.1",
+  "description": "seazmq javascript implementation",
+  "main": "seazmq.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AtlasHands/SeaZMQ.git"
+  },
+  "author": "Keefer Sands",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/AtlasHands/SeaZMQ/issues"
+  },
+  "homepage": "https://github.com/AtlasHands/SeaZMQ#readme",
+  "dependencies": {
+    "async-lock": "^1.2.4",
+    "zeromq": "^6.0.0-beta.6"
+  }
+}
