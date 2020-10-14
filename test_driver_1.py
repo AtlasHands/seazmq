@@ -3,12 +3,18 @@ import time
 
 
 def ping(ctx: SeaZMQResponder):
-    ctx.send("ping")
-
+    ctx.send_subscribe(ctx.publisher.address, ["status", "something-else"])
+    count = 0
+    ctx.publish("status", {"message": "new-status-" + str(count)})
+    ctx.publish("something-else", {"message": "new-something-else-" + str(count)})
+    time.sleep(.5)
+    ctx.publish("status", {"message": "new-status-" + str(3)})
+    ctx.publish("something-else", {"message": "new-status-" + str(3)})
 
 device_map = {
     "self": {
         "bind": "tcp://127.0.0.1:80020",
+        "publish": "tcp://127.0.0.1:80021",
         "id": "ctrl-pi",
         "commands": {
             "ping": ping
@@ -21,20 +27,23 @@ device_map = {
         "conn": "tcp://127.0.0.1:80030"
     }
 }
-# initialize device map
-seazmq = SeaZMQ(device_map)
-# quick references for objects
-rpi1 = seazmq.client_map["rpi1"]
-rpi2 = seazmq.client_map["rpi2"]
-# timeout is default 3 seconds
+
+responder = SeaZMQRouter({
+    "bind": "tcp://127.0.0.1:80020",
+    "publish": "tcp://127.0.0.1:80021",
+    "id": "ctrl-pi",
+    "commands": {
+        "ping": ping
+    }
+})
+dealer = SeaZMQDealer({
+    "conn": "tcp://127.0.0.1:80020",
+})
+resp = dealer.send({"command": "ping"})
+resp.close()
+resp2 = dealer.send({"command": "ping"})
 while 1:
-    ping_resp = rpi2.send({"command": "ping"})
-    ping_resp.done_event.wait(1000)
-    if ping_resp.done_event.is_set():
-        data = ping_resp.get_data()
-        print(data)
-    else:
-        print("No response received!")
-    time.sleep(3)
-# stop threads
-seazmq.stop()
+    resp.stream_event.wait(1)
+    print(resp.get_stream())
+    resp2.stream_event.wait(1)
+    print(resp2.get_stream())

@@ -57,12 +57,14 @@ class SeaZMQRouter:
         # if bind is present
         if definition["bind"] is not None:
             # setup zmq rep using the bind provided
-            self.context = zmq.Context()
-            self.socket = self.context.socket(zmq.ROUTER)
-            self.socket.bind(definition["bind"])
+            context = zmq.Context()
+            self.router_socket = context.socket(zmq.ROUTER)
+            self.router_socket.bind(definition["bind"])
         else:
             print("No bind argument found for REP type device")
             return
+        if definition["publish"]:
+            self.publisher = SeaZMQPublisher(definition["publish"])
         # set this rep sockets commands
         self.commands = definition["commands"]
         # start listening thread
@@ -77,20 +79,25 @@ class SeaZMQRouter:
         while not self.stop:
             try:
                 # poll for data (safe for not thread blocking forever, and then never stopping)
-                has_data = self.socket.poll(1000)
+                has_data = self.router_socket.poll(1000)
                 # == 0 if no data is present
                 if has_data != 0:
                     # recv route and json
-                    route_id, json_data = self.socket.recv_multipart()
+                    route_id, json_data = self.router_socket.recv_multipart()
                     # turn json into dict
                     data = json.loads(json_data)
+                    # get last data provides a topic to get data from
+                    if "get-last-value" in data:
+                        last_data = self.publisher.lvc.get_last_value(data["get-last-value"])
+                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id)
+                        # if none gets turned into null
+                        responder.send({"last-value": last_data})
                     # if callback exists, call it
-                    if self.commands[data["command"]] is not None:
+                    elif self.commands[data["command"]] is not None:
                         # set up a responder so we can send it to whatever callback is assigned to this command
-                        responder = SeaZMQResponder(data, self.socket, route_id)
-                        # call callback, passing responder, leave it up to caller if they want to do sync,
-                        # by default operates in sync
-                        self.commands[data["command"]](responder)
+                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id)
+                        callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
+                        callback_thread.start()
             except zmq.error.ZMQError:
                 pass
 
@@ -106,7 +113,7 @@ class SeaZMQResponder:
     """
     SeaZMQResponder handles providing an easy object interface for communicating with a requester
     """
-    def __init__(self, request_data, socket, route_id):
+    def __init__(self, request_data, router_socket, publisher, route_id):
         """
             Initialize data needed to send a packet back to the sender.
 
@@ -115,14 +122,25 @@ class SeaZMQResponder:
             :arg route_id: route_id given by router
         """
         self.request_data = request_data
-        self.socket = socket
+        self.router_socket = router_socket
+        self.publisher = publisher
         self.route_id = route_id
 
     def get_data(self):
         """ get requesters data (just in case sender has a flag they passed)"""
         return self.request_data
 
-    def send(self, data, is_stream=False, done=False):
+    def send_subscribe(self, address, topics):
+        self.send({"subscribe-to": address, "subscribe-topics": topics})
+
+    def publish(self, topic, data):
+        data_dict = {}
+        data_dict["data"] = data
+        if "timestamp" not in data_dict:
+            data_dict["timestamp"] = time.time()
+        self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
+
+    def send(self, data):
         """
         Send a response back to a requester.
 
@@ -132,15 +150,14 @@ class SeaZMQResponder:
         """
         response_dict = {}
         transaction_id = self.request_data["transaction-id"]
-        response_dict["stream"] = is_stream
-        # only include done status if it's a stream, if it's not a single response indicates done
-        if is_stream:
-            response_dict["done"] = done
         response_dict["transaction-id"] = transaction_id
-
         response_dict["response"] = data
         # router requires the route id to be 0 frame of multipart
-        self.socket.send_multipart([self.route_id, bytes(json.dumps(response_dict), "utf-8")])
+        self.router_socket.send_multipart([self.route_id, bytes(json.dumps(response_dict), "utf-8")])
+
+
+GLOBAL_SUBSCRIBERS = {}
+ADD_SUBSCRIBER_LOCK = threading.Lock()
 
 
 class SeaZMQDealer:
@@ -193,17 +210,102 @@ class SeaZMQDealer:
                 if has_response != 0:
                     # router strips 0 frame of  multipart, so this is just json
                     message = self.socket.recv_json()
-                    # if its a stream, add to data array
-                    if message["stream"] is True:
-                        self.response_router[message["transaction-id"]].set_stream_data(message)
+                    # received a command  to subscribe to a socket
+                    if "subscribe-to" in message["response"]:
+                        if "subscribe-topics" in message["response"]:
+                            topics = message["response"]["subscribe-topics"]
+                            for i in topics:
+                                self.add_stream(message["response"]["subscribe-to"], i, self.response_router[message["transaction-id"]])
                     else:
-                        # if its not a stream, set data
                         self.response_router[message["transaction-id"]].set_data(message)
                 # check timeout array for any items that need to be timed out
                 self.set_timeouts()
             # catch zmq errors by forcible close
             except zmq.error.ZMQError:
                 pass
+
+    def add_stream(self, address, topic, subscriber):
+        # need to have a lock over the top so that this process is not done twice for two spawning threads on the
+        # same topic/address
+        sub_initialization = False
+        with ADD_SUBSCRIBER_LOCK:
+            if address not in GLOBAL_SUBSCRIBERS:
+                GLOBAL_SUBSCRIBERS[address] = {}
+            # initialize
+            if topic not in GLOBAL_SUBSCRIBERS[address]:
+                GLOBAL_SUBSCRIBERS[address][topic] = {
+                    "subscribers": [subscriber],
+                    "last-value": None,
+                    "lock": threading.Lock(),  # this lock is used when manipulating subscribers/sending to subscribers
+                    "last-value-lock": threading.Lock()
+                }
+                start_stream_listener = threading.Thread(target=self.stream_listener, args=[address, topic])
+                start_stream_listener.start()
+                sub_initialization = True
+            else:
+                with GLOBAL_SUBSCRIBERS[address][topic]["lock"]:
+                    GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].append(subscriber)
+
+        if sub_initialization:
+            time.sleep(.005)
+        # every subscriber needs to get last message regardless of if a request is required
+        get_last_message = threading.Thread(target=self._get_last_value, args=[address, topic, subscriber])
+        get_last_message.start()
+
+    def _update_subscribers(self, address, topic, data):
+        if address in GLOBAL_SUBSCRIBERS:
+            if topic in GLOBAL_SUBSCRIBERS[address]:
+                with GLOBAL_SUBSCRIBERS[address][topic]["lock"] and ADD_SUBSCRIBER_LOCK:
+                    GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data
+                    subscribers = GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]
+                    index = 0
+                    while index < len(GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]):
+                        # print("Updating subscribers")
+                        if GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index].closed is True:
+                            print("Removing subscriber")
+                            del GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index]
+                        else:
+                            GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index].update_stream(topic, data)
+                            index += 1
+
+    # stream listener is always spawned after object initialization
+    def stream_listener(self, address, topic):
+        context = zmq.Context()
+        sub_socket = context.socket(zmq.SUB)
+        sub_socket.connect(address)
+        # subscribe to topic
+        sub_socket.subscribe(topic)
+        GLOBAL_SUBSCRIBERS[address][topic]["socket"] = sub_socket
+        while not self.stop:
+            has_data = sub_socket.poll(1000)  # prevent thread locking in case of requested stop
+            if has_data != 0:
+                data = sub_socket.recv_string()
+                split = data.split(" ", 1)
+                json_data = json.loads(split[1])
+                self._update_subscribers(address, topic, json_data)
+
+    # get last value for a single subscriber
+    def _get_last_value(self, address, topic, subscriber):
+        # check if data structure is already set up
+        if address in GLOBAL_SUBSCRIBERS:
+            if topic in GLOBAL_SUBSCRIBERS[address]:
+                with GLOBAL_SUBSCRIBERS[address][topic]["last-value-lock"]:
+                    # last value lock will release and give the next getter the last value if received
+                    if GLOBAL_SUBSCRIBERS[address][topic]["last-value"] is not None:
+                        subscriber.update_stream(topic, GLOBAL_SUBSCRIBERS[address][topic]["last-value"])
+                    else:
+                        sea_dealer = SeaZMQDealer({"conn": "tcp://127.0.0.1:80020"})
+                        # change to send to address and topic of sub
+                        resp = sea_dealer.send({"get-last-value": topic})
+                        while not self.stop:
+                            has_data = resp.data_event.wait(1)
+                            if has_data != 0:
+                                data = resp.get_data()
+                                if "response" in data:
+                                    if "last-value" in data["response"]:
+                                        if data["response"]["last-value"] is not None:
+                                            subscriber.update_stream(topic, data["response"]["last-value"])
+                                        break
 
     def set_timeouts(self):
         """
@@ -277,6 +379,7 @@ class SeaZMQDealer:
         :param int timeout: seconds for a timeout (send Math.inf) for no timeout - possibly for streams
         """
         # I know that you don't have to do this, but it signifies what's important coming out of the lock
+
         response_obj = None
         json_data = None
         with self.counter_lock:
@@ -313,36 +416,57 @@ class SeaZMQResponse:
         self.data_event = threading.Event()
         # done event that triggers when communication for a request is finished
         self.done_event = threading.Event()
+        self.stream_lock = threading.Lock()
+        self.stream_event = threading.Event()
+        # last timestamp ensures that only new data is forwarded to callers
+        self.last_topic_timestamp = {}
+        self.stream = []
         # the holder for the data
         self.data = None
+        self.closed = False
+        self.is_streaming = False
+
+    def close(self):
+        self.closed = True
+
+    def set_streaming(self):
+        self.is_streaming = True
+
+    def update_stream(self, topic, data):
+
+        if not self.is_streaming:
+            self.set_streaming()
+        with self.stream_lock:
+            if "timestamp" in data:
+                # old message
+                if topic in self.last_topic_timestamp:
+                    if self.last_topic_timestamp[topic] >= data["timestamp"]:
+                        return
+                    else:
+                        self.last_topic_timestamp[topic] = data["timestamp"]
+                else:
+                    self.last_topic_timestamp[topic] = data["timestamp"]
+            data["topic"] = topic
+            self.stream.append(data)
+            self.stream_event.set()
+
+    def get_stream(self, reset_event=True):
+        with self.stream_lock:
+            stream = copy.deepcopy(self.stream)
+            self.stream = []
+            if reset_event is True:
+                self.stream_event.clear()
+            return stream
 
     def set_timed_out(self):
         with self.read_lock:
             # request not finished before timeout invalidation
-            if not self.done_event.is_set():
+            if not self.done_event.is_set() and not self.is_streaming:
                 dict = {
                     "request": self.sent_data,
                     "response": "timeout",
                 }
                 self.data = dict
-                self.done_event.set()
-
-    def set_stream_data(self, data: dict):
-        """
-        sets the stream data, will append to an array of past data elements
-
-        :param dict data: the data provided as a response to the request
-        """
-        with self.read_lock:
-            # if we have not initialized the data list initialize it
-            if self.data is None:
-                self.data = []
-
-            self.data.append(data)
-            # received data, set the data event
-            self.data_event.set()
-            # if we indicate that it is done, set the done event
-            if data["done"] is True:
                 self.done_event.set()
 
     def set_data(self, data: dict):
@@ -371,3 +495,58 @@ class SeaZMQResponse:
                     self.data = None
                 self.data_event.clear()
                 return data
+
+
+# simple wrapper for publisher socket that creates an LVC
+class SeaZMQPublisher:
+    def __init__(self, bind):
+        # cache_map
+        self.cache_map = {}
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PUB)
+        self.socket.bind(bind)
+        self.address = bind
+        self.lvc = SeaZMQLVC(bind)
+
+    def send_start_topic(self, topics):
+        for i in range(topics):
+            self.socket.send_string("%s %s", i, json.dumps({"topic-start: true"}))
+
+    def send_end_topic(self, topics):
+        for i in range(topics):
+            self.socket.send_string("%s %s", i, json.dumps({"topic-end: true"}))
+
+    def send_string(self, message):
+        self.socket.send_string(message)
+
+
+class SeaZMQLVC:
+    def __init__(self, sub_address):
+        self.cache_map = {}
+        self.stop = False
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.SUB)
+        self.socket.connect(sub_address)
+        # subscribe to all topics
+        self.socket.subscribe(b'')
+        thread = threading.Thread(target=self.listen)
+        thread.start()
+
+    def get_last_value(self, topic):
+        if topic in self.cache_map:
+            return self.cache_map[topic]
+        else:
+            return None
+
+    def listen(self):
+        while not self.stop:
+            has_results = self.socket.poll(1000)
+            if has_results:
+                string_data = self.socket.recv_string()
+                split = string_data.split(" ", 1)
+                data = json.loads(split[1])
+                topic = split[0]
+                self.cache_map[topic] = data
+
+    def stop_threads(self):
+        self.stop = True
