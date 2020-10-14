@@ -54,16 +54,19 @@ class SeaZMQRouter:
     def __init__(self, definition):
         # set up stopping
         self.stop = False
+        self.publisher = None
+        self.router_address = ""
         # if bind is present
-        if definition["bind"] is not None:
+        if "bind" in definition:
             # setup zmq rep using the bind provided
             context = zmq.Context()
             self.router_socket = context.socket(zmq.ROUTER)
+            self.router_address = definition["bind"]
             self.router_socket.bind(definition["bind"])
         else:
             print("No bind argument found for REP type device")
             return
-        if definition["publish"]:
+        if "publish" in definition:
             self.publisher = SeaZMQPublisher(definition["publish"])
         # set this rep sockets commands
         self.commands = definition["commands"]
@@ -95,7 +98,7 @@ class SeaZMQRouter:
                     # if callback exists, call it
                     elif self.commands[data["command"]] is not None:
                         # set up a responder so we can send it to whatever callback is assigned to this command
-                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id)
+                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id, self.router_address)
                         callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
                         callback_thread.start()
             except zmq.error.ZMQError:
@@ -113,7 +116,7 @@ class SeaZMQResponder:
     """
     SeaZMQResponder handles providing an easy object interface for communicating with a requester
     """
-    def __init__(self, request_data, router_socket, publisher, route_id):
+    def __init__(self, request_data, router_socket, publisher, route_id, lvc=None):
         """
             Initialize data needed to send a packet back to the sender.
 
@@ -125,28 +128,35 @@ class SeaZMQResponder:
         self.router_socket = router_socket
         self.publisher = publisher
         self.route_id = route_id
+        self.lvc = lvc
 
     def get_data(self):
         """ get requesters data (just in case sender has a flag they passed)"""
         return self.request_data
 
-    def send_subscribe(self, address, topics):
-        self.send({"subscribe-to": address, "subscribe-topics": topics})
+    def send_subscribe(self, address, topics, lvc=None):
+        if lvc is not None:
+            self.send({"subscribe-to": address, "subscribe-topics": topics, "lvc": lvc})
+        elif self.lvc is not None:
+            self.send({"subscribe-to": address, "subscribe-topics": topics, "lvc": self.lvc})
+        else:
+            self.send({"subscribe-to": address, "subscribe-topics": topics})
 
     def publish(self, topic, data):
-        data_dict = {}
-        data_dict["data"] = data
-        if "timestamp" not in data_dict:
-            data_dict["timestamp"] = time.time()
-        self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
+        if self.publisher is not None:
+            data_dict = {}
+            data_dict["data"] = data
+            if "timestamp" not in data_dict:
+                data_dict["timestamp"] = time.time()
+            self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
+        else:
+            print("Unable to publish event without a publisher defined")
 
     def send(self, data):
         """
         Send a response back to a requester.
 
         :param data: the data being sent (must be jsonable)
-        :param bool is_stream: indicate to the requester that the response has multiple packets
-        :param bool is_stream: if the send is a stream, done indicates to the requester that its done with streaming
         """
         response_dict = {}
         transaction_id = self.request_data["transaction-id"]
@@ -158,7 +168,6 @@ class SeaZMQResponder:
 
 GLOBAL_SUBSCRIBERS = {}
 ADD_SUBSCRIBER_LOCK = threading.Lock()
-
 
 class SeaZMQDealer:
     """
@@ -215,7 +224,9 @@ class SeaZMQDealer:
                         if "subscribe-topics" in message["response"]:
                             topics = message["response"]["subscribe-topics"]
                             for i in topics:
-                                self.add_stream(message["response"]["subscribe-to"], i, self.response_router[message["transaction-id"]])
+                                self.add_stream(message["response"]["subscribe-to"], i,
+                                                self.response_router[message["transaction-id"]],
+                                                message["response"]["lvc"])
                     else:
                         self.response_router[message["transaction-id"]].set_data(message)
                 # check timeout array for any items that need to be timed out
@@ -224,7 +235,7 @@ class SeaZMQDealer:
             except zmq.error.ZMQError:
                 pass
 
-    def add_stream(self, address, topic, subscriber):
+    def add_stream(self, address, topic, subscriber, lvc):
         # need to have a lock over the top so that this process is not done twice for two spawning threads on the
         # same topic/address
         sub_initialization = False
@@ -247,10 +258,10 @@ class SeaZMQDealer:
                 with GLOBAL_SUBSCRIBERS[address][topic]["lock"]:
                     GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].append(subscriber)
 
-        # if sub_initialization:
-        #     time.sleep(.005)
+        if sub_initialization:
+            time.sleep(.005)
         # every subscriber needs to get last message regardless of if a request is required
-        get_last_message = threading.Thread(target=self._get_last_value, args=[address, topic, subscriber])
+        get_last_message = threading.Thread(target=self._get_last_value, args=[address, topic, subscriber, lvc])
         get_last_message.start()
 
     def _update_subscribers(self, address, topic, data):
@@ -301,7 +312,7 @@ class SeaZMQDealer:
                 self._update_subscribers(address, topic, json_data)
 
     # get last value for a single subscriber
-    def _get_last_value(self, address, topic, subscriber):
+    def _get_last_value(self, address, topic, subscriber, lvc):
         # check if data structure is already set up
         if address in GLOBAL_SUBSCRIBERS:
             if topic in GLOBAL_SUBSCRIBERS[address]:
@@ -310,16 +321,17 @@ class SeaZMQDealer:
                     if GLOBAL_SUBSCRIBERS[address][topic]["last-value"] is not None:
                         subscriber.update_stream(topic, GLOBAL_SUBSCRIBERS[address][topic]["last-value"])
                     else:
-                        sea_dealer = SeaZMQDealer({"conn": "tcp://127.0.0.1:80020"})
+                        sea_dealer = SeaZMQDealer({"conn": lvc})
                         # change to send to address and topic of sub
                         resp = sea_dealer.send({"get-last-value": topic})
                         while not self.stop:
-                            has_data = resp.data_event.wait(1)
+                            has_data = resp.response_event.wait(1)
                             if has_data != 0:
-                                data = resp.get_data()
+                                data = resp.get_response()
                                 if "response" in data:
                                     if "last-value" in data["response"]:
                                         if data["response"]["last-value"] is not None:
+                                            GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data["response"]["last-value"]
                                             subscriber.update_stream(topic, data["response"]["last-value"])
                                         break
 
@@ -395,7 +407,6 @@ class SeaZMQDealer:
         :param int timeout: seconds for a timeout (send Math.inf) for no timeout - possibly for streams
         """
         # I know that you don't have to do this, but it signifies what's important coming out of the lock
-
         response_obj = None
         json_data = None
         with self.counter_lock:
@@ -428,10 +439,8 @@ class SeaZMQResponse:
         self.sent_data = sent_data
         # read lock for data setting and getting
         self.read_lock = threading.Lock()
-        # data event that triggers whenever a response comes through
-        self.data_event = threading.Event()
         # done event that triggers when communication for a request is finished
-        self.done_event = threading.Event()
+        self.response_event = threading.Event()
         self.stream_lock = threading.Lock()
         self.stream_event = threading.Event()
         # last timestamp ensures that only new data is forwarded to callers
@@ -478,14 +487,14 @@ class SeaZMQResponse:
 
     def set_timed_out(self):
         with self.read_lock:
-            # request not finished before timeout invalidation
-            if not self.done_event.is_set() and not self.is_streaming:
+            # request not finished before timeout invalidation, don't trigger timeout if streaming
+            if not self.response_event.is_set() and not self.is_streaming:
                 dict = {
                     "request": self.sent_data,
                     "response": "timeout",
                 }
                 self.data = dict
-                self.done_event.set()
+                self.response_event.set()
 
     def set_data(self, data: dict):
         """
@@ -494,12 +503,12 @@ class SeaZMQResponse:
         :param dict data: the data provided as a response to the request
         """
         with self.read_lock:
-            # since its not a stream, both the data and done events get set when data is set
-            self.data = data
-            self.data_event.set()
-            self.done_event.set()
+            # only respect the first traditional response
+            if self.response_event.is_set() is False:
+                self.data = data
+                self.response_event.set()
 
-    def get_data(self, pop=False):
+    def get_response(self):
         """
         get the response data
 
@@ -508,10 +517,9 @@ class SeaZMQResponse:
         with self.read_lock:
             if self.data is not None:
                 self.data["request"] = self.sent_data
+                if "transaction-id" in self.data:
+                    del self.data["transaction-id"]
                 data = copy.deepcopy(self.data)
-                if pop:
-                    self.data = None
-                self.data_event.clear()
                 return data
 
 

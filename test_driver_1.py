@@ -1,54 +1,101 @@
 from main import *
 import time
-import copy
 
-counter = 0
-counter_lock = threading.Lock()
+# ===== Singleton process w/multi subscribers =====
+test_in_progress_event = threading.Event()
+test_in_progress_lock = threading.Lock()
 
-def ping(ctx: SeaZMQResponder):
-    ctx.send_subscribe(ctx.publisher.address, ["status", "something-else"])
-    global counter, counter_lock
-    with counter_lock:
-        counter += 1
-        count_ref = copy.copy(counter)
-    ctx.publish("status", {"message": "new-status-" + str(count_ref)})
-    time.sleep(.5)
-    ctx.publish("something-else", {"message": "new-status-" + str(count_ref)})
+def start_test(ctx):
+    ctx.send_subscribe(ctx.publisher.address, ["test-status", "device-info"])
+    with test_in_progress_lock:
+        if test_in_progress_event.is_set():
+            ctx.send("Test Already in Progress")
+            return
+        else:
+            test_in_progress_event.set()
+            ctx.send("Test Started")
 
-device_map = {
-    "self": {
-        "bind": "tcp://127.0.0.1:80020",
-        "publish": "tcp://127.0.0.1:80021",
-        "id": "ctrl-pi",
-        "commands": {
-            "ping": ping
-        }
-    },
-    "rpi1": {
-        "conn": "tcp://127.0.0.1:80025",
-    },
-    "rpi2": {
-        "conn": "tcp://127.0.0.1:80030"
-    }
-}
+    ctx.publish("test-status", {
+        "stage-1": "started",
+        "stage-2": "not started"
+    })
+    ctx.publish("device-info", {
+        "light": "yes",
+        "air": "no"
+    })
+    time.sleep(1)
+    ctx.publish("test-status", {
+        "stage-1": "test-finish-success",
+        "stage-2": "started",
+    })
+    time.sleep(1)
+    ctx.publish("test-status", {
+        "stage-1": "test-finish-success",
+        "stage-2": "test-finish-failure",
+    })
+    with test_in_progress_lock:
+        test_in_progress_event.clear()
 
-responder = SeaZMQRouter({
-    "bind": "tcp://127.0.0.1:80020",
-    "publish": "tcp://127.0.0.1:80021",
-    "id": "ctrl-pi",
+router = SeaZMQRouter({
+    "bind": "tcp://127.0.0.1:8000",
+    "publish": "tcp://127.0.0.1:8001",
     "commands": {
-        "ping": ping
+        "start-test": start_test,
     }
 })
-dealer = SeaZMQDealer({
-    "conn": "tcp://127.0.0.1:80020",
-})
-resp = dealer.send({"command": "ping"})
-# resp.close()
-resp2 = dealer.send({"command": "ping"})
-# resp2.close()
-while 1:
-    resp.stream_event.wait(1)
-    print("resp1", resp.get_stream())
-    resp2.stream_event.wait(1)
-    print("resp2", resp2.get_stream())
+
+dealer = SeaZMQDealer({"conn": "tcp://127.0.0.1:8000"})
+client_1 = dealer.send({"command": "start-test"})
+
+# unwrapped for easier print viewing.
+
+client_1.response_event.wait()
+print("client_1", client_1.get_response())
+# client_1 {'response': 'Test Started', 'request': '{"command": "start-test", "transaction-id": 0}'}
+
+client_1.stream_event.wait()
+print("client_1", client_1.get_stream())
+# client_1 [{'data': {'stage-1': 'started', 'stage-2': 'not started'}, 'timestamp': 1602715037.6239266, 'topic': 'test-status'}]
+client_1.stream_event.wait()
+print("client_1", client_1.get_stream())
+# client_1 [{'data': {'light': 'yes', 'air': 'no'}, 'timestamp': 1602715383.419707, 'topic': 'device-info'}]
+
+
+client_2 = dealer.send({"command": "start-test"})
+
+client_2.response_event.wait()
+print("client_2", client_2.get_response())
+# client_2 {'response': 'Test Already in Progress', 'request': '{"command": "start-test", "transaction-id": 1}'}
+
+client_2.stream_event.wait()
+print("client_2", client_2.get_stream())
+# client_2 [{'data': {'stage-1': 'started', 'stage-2': 'not started'}, 'timestamp': 1602715621.5179632, 'topic': 'test-status'}, {'data': {'light': 'yes', 'air': 'no'}, 'timestamp': 1602715621.5179632, 'topic': 'device-info'}]
+
+client_1.stream_event.wait()
+print("client_1", client_1.get_stream())
+# client_1 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'started'}, 'timestamp': 1602715622.5243034, 'topic': 'test-status'}]
+
+client_2.stream_event.wait()
+print("client_2", client_2.get_stream())
+# client_2 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'started'}, 'timestamp': 1602715622.5243034, 'topic': 'test-status'}]
+
+client_1.stream_event.wait()
+print("client_1", client_1.get_stream())
+# client_1 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'test-finish-failure'}, 'timestamp': 1602715623.5249596, 'topic': 'test-status'}]
+
+client_2.stream_event.wait()
+print("client_2", client_2.get_stream())
+# client_2 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'test-finish-failure'}, 'timestamp': 1602715623.5249596, 'topic': 'test-status'}]
+client_1.close()
+client_2.close()
+# client_1 {'response': 'Test Started', 'request': '{"command": "start-test", "transaction-id": 0}'}
+# client_1 [{'data': {'stage-1': 'started', 'stage-2': 'not started'}, 'timestamp': 1602715708.5011637, 'topic': 'test-status'}]
+# client_1 [{'data': {'light': 'yes', 'air': 'no'}, 'timestamp': 1602715708.5011637, 'topic': 'device-info'}]
+# client_2 {'response': 'Test Already in Progress', 'request': '{"command": "start-test", "transaction-id": 1}'}
+# client_2 [{'data': {'stage-1': 'started', 'stage-2': 'not started'}, 'timestamp': 1602715708.5011637, 'topic': 'test-status'}, {'data': {'light': 'yes', 'air': 'no'}, 'timestamp': 1602715708.5011637, 'topic': 'device-info'}]
+# client_1 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'started'}, 'timestamp': 1602715709.5021574, 'topic': 'test-status'}]
+# client_2 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'started'}, 'timestamp': 1602715709.5021574, 'topic': 'test-status'}]
+# client_1 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'test-finish-failure'}, 'timestamp': 1602715710.5024981, 'topic': 'test-status'}]
+# client_2 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'test-finish-failure'}, 'timestamp': 1602715710.5024981, 'topic': 'test-status'}]
+
+# ===== End of Singleton process w/multi subscribers =====
