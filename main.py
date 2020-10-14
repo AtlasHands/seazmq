@@ -237,7 +237,8 @@ class SeaZMQDealer:
                     "subscribers": [subscriber],
                     "last-value": None,
                     "lock": threading.Lock(),  # this lock is used when manipulating subscribers/sending to subscribers
-                    "last-value-lock": threading.Lock()
+                    "last-value-lock": threading.Lock(),
+                    "is-global": False,  # global listeners don't need subscribers to remain live
                 }
                 start_stream_listener = threading.Thread(target=self.stream_listener, args=[address, topic])
                 start_stream_listener.start()
@@ -246,8 +247,8 @@ class SeaZMQDealer:
                 with GLOBAL_SUBSCRIBERS[address][topic]["lock"]:
                     GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].append(subscriber)
 
-        if sub_initialization:
-            time.sleep(.005)
+        # if sub_initialization:
+        #     time.sleep(.005)
         # every subscriber needs to get last message regardless of if a request is required
         get_last_message = threading.Thread(target=self._get_last_value, args=[address, topic, subscriber])
         get_last_message.start()
@@ -255,18 +256,27 @@ class SeaZMQDealer:
     def _update_subscribers(self, address, topic, data):
         if address in GLOBAL_SUBSCRIBERS:
             if topic in GLOBAL_SUBSCRIBERS[address]:
-                with GLOBAL_SUBSCRIBERS[address][topic]["lock"] and ADD_SUBSCRIBER_LOCK:
-                    GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data
-                    subscribers = GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]
-                    index = 0
-                    while index < len(GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]):
-                        # print("Updating subscribers")
-                        if GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index].closed is True:
-                            print("Removing subscriber")
-                            del GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index]
-                        else:
-                            GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index].update_stream(topic, data)
-                            index += 1
+                with ADD_SUBSCRIBER_LOCK:
+                    with GLOBAL_SUBSCRIBERS[address][topic]["lock"]:
+                        GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data
+                        index = 0
+                        while index < len(GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]):
+                            # print("Updating subscribers")
+                            if GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index].closed is True:
+                                # print("Removing subscriber")
+                                GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].pop(index)
+                                if len(GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]) == 0:
+                                    if GLOBAL_SUBSCRIBERS[address][topic]["is-global"] is False:
+                                        # print("removed data obj")
+                                        del GLOBAL_SUBSCRIBERS[address][topic]
+                                        if len(GLOBAL_SUBSCRIBERS[address]) == 0:
+                                            del GLOBAL_SUBSCRIBERS[address]
+                                        # cannot iterate something that doesn't exist anymore
+                                        return
+                            else:
+                                # print("Updating stream")
+                                GLOBAL_SUBSCRIBERS[address][topic]["subscribers"][index].update_stream(topic, data)
+                                index += 1
 
     # stream listener is always spawned after object initialization
     def stream_listener(self, address, topic):
@@ -278,6 +288,12 @@ class SeaZMQDealer:
         GLOBAL_SUBSCRIBERS[address][topic]["socket"] = sub_socket
         while not self.stop:
             has_data = sub_socket.poll(1000)  # prevent thread locking in case of requested stop
+            # handle removing listeners with no object
+            if address not in GLOBAL_SUBSCRIBERS:
+                return
+            else:
+                if topic not in GLOBAL_SUBSCRIBERS[address]:
+                    return
             if has_data != 0:
                 data = sub_socket.recv_string()
                 split = data.split(" ", 1)
@@ -433,14 +449,16 @@ class SeaZMQResponse:
         self.is_streaming = True
 
     def update_stream(self, topic, data):
-
         if not self.is_streaming:
             self.set_streaming()
+        if self.closed:
+            return
         with self.stream_lock:
             if "timestamp" in data:
                 # old message
                 if topic in self.last_topic_timestamp:
                     if self.last_topic_timestamp[topic] >= data["timestamp"]:
+                        # print("Old Message")
                         return
                     else:
                         self.last_topic_timestamp[topic] = data["timestamp"]
@@ -501,6 +519,7 @@ class SeaZMQResponse:
 class SeaZMQPublisher:
     def __init__(self, bind):
         # cache_map
+        self.send_lock = threading.Lock()
         self.cache_map = {}
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
@@ -509,15 +528,18 @@ class SeaZMQPublisher:
         self.lvc = SeaZMQLVC(bind)
 
     def send_start_topic(self, topics):
-        for i in range(topics):
-            self.socket.send_string("%s %s", i, json.dumps({"topic-start: true"}))
+        with self.send_lock:
+            for i in range(topics):
+                self.socket.send_string("%s %s", i, json.dumps({"topic-start: true"}))
 
     def send_end_topic(self, topics):
-        for i in range(topics):
-            self.socket.send_string("%s %s", i, json.dumps({"topic-end: true"}))
+        with self.send_lock:
+            for i in range(topics):
+                self.socket.send_string("%s %s", i, json.dumps({"topic-end: true"}))
 
     def send_string(self, message):
-        self.socket.send_string(message)
+        with self.send_lock:
+            self.socket.send_string(message)
 
 
 class SeaZMQLVC:
@@ -546,6 +568,10 @@ class SeaZMQLVC:
                 split = string_data.split(" ", 1)
                 data = json.loads(split[1])
                 topic = split[0]
+                if "topic-end" in data:
+                    self.cache_map[topic] = None
+                if "topic-start" in data:
+                    self.cache_map[topic] = None
                 self.cache_map[topic] = data
 
     def stop_threads(self):

@@ -1,15 +1,19 @@
 from main import *
 import time
+import copy
 
+counter = 0
+counter_lock = threading.Lock()
 
 def ping(ctx: SeaZMQResponder):
     ctx.send_subscribe(ctx.publisher.address, ["status", "something-else"])
-    count = 0
-    ctx.publish("status", {"message": "new-status-" + str(count)})
-    ctx.publish("something-else", {"message": "new-something-else-" + str(count)})
+    global counter, counter_lock
+    with counter_lock:
+        counter += 1
+        count_ref = copy.copy(counter)
+    ctx.publish("status", {"message": "new-status-" + str(count_ref)})
     time.sleep(.5)
-    ctx.publish("status", {"message": "new-status-" + str(3)})
-    ctx.publish("something-else", {"message": "new-status-" + str(3)})
+    ctx.publish("something-else", {"message": "new-status-" + str(count_ref)})
 
 device_map = {
     "self": {
@@ -40,10 +44,11 @@ dealer = SeaZMQDealer({
     "conn": "tcp://127.0.0.1:80020",
 })
 resp = dealer.send({"command": "ping"})
-resp.close()
+# resp.close()
 resp2 = dealer.send({"command": "ping"})
+# resp2.close()
 while 1:
     resp.stream_event.wait(1)
-    print(resp.get_stream())
+    print("resp1", resp.get_stream())
     resp2.stream_event.wait(1)
-    print(resp2.get_stream())
+    print("resp2", resp2.get_stream())
