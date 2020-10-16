@@ -31,13 +31,16 @@ class SeaZMQRouter{
     constructor(definition){
         let ref = this;
         if(definition.bind != undefined){
-            this.socket = new zmq.Router
-            this.socket.receiveTimeout = this.socket_poll_timeout
-            this.socket.bind(definition.bind).then(function(){
+            this.router_socket = new zmq.Router
+            this.router_socket.receiveTimeout = this.socket_poll_timeout
+            this.router_socket.bind(definition.bind).then(function(){
                 ref.listener()
             })
         }else{
             throw new Error("No bind argument found for Router type device")
+        }
+        if(definition.publish != undefined){
+            this.pubisher = SeaZMQPublisher(definition.publish)
         }
         this.commands = definition.commands
     }
@@ -47,7 +50,11 @@ class SeaZMQRouter{
             try{
                 let route_id = message[0]
                 let request = JSON.parse(message[1].toString("utf-8"))
-                if(ref.commands[request.command] != undefined){
+                if(ref["get-last-value"] != undefined){
+                    last_data = this.publisher.get_last_value(data["get-last-value"])
+                    responder = SeaZMQResponder(data, this.router_socket, this.publisher, route_id)
+                    responder.send({"last-value": last_data})
+                }else if(ref.commands[request.command] != undefined){
                     let responder = new SeaZMQResponder(request,ref.socket,route_id)
                     ref.commands[request.command](responder)
                 }
@@ -73,21 +80,42 @@ class SeaZMQResponder{
     request_data = undefined;
     socket = undefined;
     route_id = undefined
-    constructor(request_data, socket, route_id){
+    constructor(request_data, socket, route_id, publisher, lvc=undefined){
         this.request_data = request_data
         this.socket = socket
         this.route_id = route_id
+        this.publisher = publisher
+        this.lvc = lvc
     }
     get_data(){
         return JSON.parse(JSON.stringify(this.request_data))
     }
-    send(data, is_stream=false, done=false){
+    send_subscribe(address, topics, lvc=undefined){
+        let send_dict = {
+            "subscribe-to": address,
+            "subscribe-topics": topics,
+        }
+        if(lvc != undefined){
+            send_dict.lvc = lvc
+        }else if(this.lvc != undefined){
+            send_dict.lvc = this.lvc
+        }
+        this.send(send_dict)
+    }
+    publish(topic, data){
+        if(this.publisher != undefined){
+            let data_dict = {}
+            data_dict.data = data
+            // ms to s
+            data_dict.timestamp = Date.now()/1000
+            this.publisher.send_string(topic + " " + JSON.stringify(data_dict))
+        }else{
+            console.log("Unable to publish event without a publisher defined")
+        }
+    }
+    send(data){
         let response_json = {
             "transaction-id": this.request_data["transaction-id"],
-            "stream": is_stream
-        }
-        if(is_stream){
-            response_json["done"]= done
         }
         response_json["response"] = data
         this.socket.send([this.route_id, JSON.stringify(response_json)]).catch(function(err){
@@ -95,6 +123,11 @@ class SeaZMQResponder{
         })
     }
 }
+
+
+GLOBAL_SUBSCRIBERS = {}
+ADD_SUBSCRIBER_LOCK = new AsyncLock()
+
 
 class SeaZMQDealer{
     stop = false
@@ -132,10 +165,17 @@ class SeaZMQDealer{
         this.socket.receive().then(function(message){
             try{
                 message = JSON.parse(message.toString("utf-8"))
-                if(message.stream == true){
-                    ref.response_router[message["transaction-id"]].set_stream_data(message)
+                if(message["subscribe-to"] != undefined){
+                    if(message["subscribe-topics"] != undefined){
+                        response = message["response"]
+                        topics = response["subscribe-topics"]
+                        response_obj = ref.response_router[message["transaction-id"]]
+                        for(topic of topics){
+                            ref.add_stream(response["subscribe-to"], topic, response_obj, response["lvc"])
+                        }
+                    }
                 }else{
-                    ref.response_router[message["transaction-id"]].set_data(message)
+                    ref.response_router[message["transaction-id"]].set_response(message)
                 }
             }catch(error){
                 console.log(error)
@@ -150,6 +190,96 @@ class SeaZMQDealer{
                 ref.listener()
             }
         })
+    }
+    add_stream(address, topic, subscriber, lvc){
+        let ref = this
+        ADD_SUBSCRIBER_LOCK.acquire("", function(){
+            if(GLOBAL_SUBSCRIBERS[address] == undefined){
+                GLOBAL_SUBSCRIBERS[address] = {}
+            }
+            if(GLOBAL_SUBSCRIBERS[address][topic] == undefined){
+                let socket = new zmq.socket("sub")
+                socket.connect(address)
+                socket.receiveTimeout = 1000
+                GLOBAL_SUBSCRIBERS[address][topic] = {
+                    "subscribers": [subscriber],
+                    "last-value": undefined,
+                    "lock": new AsyncLock(),
+                    "last-value-lock": new AsyncLock(),
+                    "is-global": false,
+                    "socket": socket,
+                }
+                ref.stream_listener(address,topic,socket)
+            }else{
+                GLOBAL_SUBSCRIBERS[address][topic]["lock"].acquire("", function(){
+                    GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].push(subscriber)
+                })
+            }
+            ref.get_last_message(address, topic, subscriber, lvc)
+        })
+    }
+    _update_subscribers(){
+        if(GLOBAL_SUBSCRIBERS["address"] != undefined){
+            if(GLOBAL_SUBSCRIBERS[address][topic] != undefined){
+                ADD_SUBSCRIBER_LOCK.acquire("", function(){
+                    GLOBAL_SUBSCRIBERS[address][topic]["lock"].acquire("", function(){
+                        GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data
+                        let index = 0
+                        while(index < GLOBAL_SUBSCRIBERS[address][topic].subscribers.length){
+                            if(GLOBAL_SUBSCRIBERS[address][topic].subscribers[index].closed == true){
+                                GLOBAL_SUBSCRIBERS[address][topic].subscribers.splice(index, 1)
+                                if(GLOBAL_SUBSCRIBERS[address][topic].subscribers.length == 0){
+                                    delete GLOBAL_SUBSCRIBERS[address][topic]
+                                    if(Object.keys(GLOBAL_SUBSCRIBERS[topic]).length == 0){
+                                        delete GLOBAL_SUBSCRIBERS[topic]
+                                    }
+                                    return
+                                }
+                            }else{
+                                GLOBAL_SUBSCRIBERS[address][topic].subscribers[index].update_stream(topic, data)
+                                index +=1
+                            }
+                        }
+                    })
+                })
+            } 
+        }
+    }
+    async stream_listener(address,topic,socket){
+        let ref = this
+        socket.receive().then(function(message){
+            console.log("pub message", message)
+        }).catch(function(){
+            console.log("timeout occured in sub listener")
+        }).finally(function(){
+            if(ref.stop != true){
+                ref.stream_listener(address,topic,socket)
+            }
+        })
+    }
+    async _get_last_value(address, topic, subscriber, lvc){
+        let ref = this
+        if(GLOBAL_SUBSCRIBERS[address] != undefined){
+            if(GLOBAL_SUBSCRIBERS[address][topic] != undefined){
+                GLOBAL_SUBSCRIBERS[address][topic]["last-value-lock"].acquire("", function(){
+                    if(GLOBAL_SUBSCRIBERS[address][topic]["last-value"] != undefined){
+                        subscriber.update_stream(topic, GLOBAL_SUBSCRIBERS[address][topic]["last-value"])
+                    }else{
+                        sea_dealer = SeaZMQDealer({conn: lvc})
+                        resp = sea_dealer.send({"get-last-value": topic})
+                        resp.on("response", function(data){
+                            if(data.response != undefined){
+                                if(data.response["last-value"] != undefined){
+                                    GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data["response"]["last-value"]
+                                    subscriber.update_stream(topic, data["response"]["last-value"])
+                                }
+                            }
+                        })
+                        sea_dealer.stop_threads()
+                    }
+                })
+            }
+        }
     }
     set_timeouts(){
         let ref = this;
@@ -219,17 +349,20 @@ class SeaZMQDealer{
 
 class SeaZMQResponse extends EventEmitter{
     sent_data = {}
-    done = false
+    stream_lock = new AsyncLock()
+    stream = []
+    last_topic_timestamp = {}
+    closed = false
+    response = undefined
     get_sent_data(){
         return this.sent_data
     }
     set_sent_data(data){
         this.sent_data = data
     }
-    set_data(data){
-        this.emit("data", data)
-        this.emit("done", data)
-        this.done = true
+    set_response(data){
+        this.response = data
+        this.emit("response", data)
     }
     set_timed_out(){
         if(!this.done){
@@ -241,12 +374,25 @@ class SeaZMQResponse extends EventEmitter{
             this.done = true
         }
     }
-    set_stream_data(data){
-        this.emit("data", data)
-        if(data.done == true){
-            this.emit("done")
-            this.done = true
+    set_streaming(){
+        this.is_streaming = true
+    }
+    update_stream(topic, data){
+        let ref = this
+        if(this.streaming == false){
+            this.set_streaming()
         }
+        stream_lock.aquire("", function(){
+            if(data.timestamp != undefined){
+                if(ref.last_topic_timestamp[topic] >= data.timestamp){
+                    return
+                }else{
+                    ref.last_topic_timestamp[topic] = data.timestamp
+                }
+            }
+            data.topic = topic
+            ref.emit("stream", data)
+        })
     }
 }
 
