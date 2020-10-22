@@ -23,16 +23,35 @@ class SeaZMQ{
     }
 }
 
+function sleep(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}   
+
+async function _listener(socket){
+    return new Promise(function(resolve, reject){
+        socket.receive().then(function(message){
+            resolve(message)
+        }).catch(function(message){
+            reject(message)
+        })
+    })
+}
+
 class SeaZMQRouter{
     stop = false;
     commands = {}
     socket = undefined
     socket_poll_timeout = 1000
+    router_address = undefined
+    publisher = undefined
     constructor(definition){
         let ref = this;
         if(definition.bind != undefined){
             this.router_socket = new zmq.Router
             this.router_socket.receiveTimeout = this.socket_poll_timeout
+            this.router_address = definition.bind
             this.router_socket.bind(definition.bind).then(function(){
                 ref.listener()
             })
@@ -40,39 +59,48 @@ class SeaZMQRouter{
             throw new Error("No bind argument found for Router type device")
         }
         if(definition.publish != undefined){
-            this.pubisher = SeaZMQPublisher(definition.publish)
+            console.log("making publisher")
+            ref.publisher = new SeaZMQPublisher(definition.publish)
         }
         this.commands = definition.commands
     }
-    listener(){
+    async listener(){
         let ref = this;
-        this.socket.receive().then(function(message){
+        while(ref.stop != true){
             try{
+                let message = await _listener(this.router_socket)
                 let route_id = message[0]
-                let request = JSON.parse(message[1].toString("utf-8"))
-                if(ref["get-last-value"] != undefined){
-                    last_data = this.publisher.get_last_value(data["get-last-value"])
-                    responder = SeaZMQResponder(data, this.router_socket, this.publisher, route_id)
-                    responder.send({"last-value": last_data})
-                }else if(ref.commands[request.command] != undefined){
-                    let responder = new SeaZMQResponder(request,ref.socket,route_id)
-                    ref.commands[request.command](responder)
+                try{
+                    let request = JSON.parse(message[1].toString("utf-8"))
+                    if(request["get-last-value"] != undefined){
+                        let last_data = ref.publisher.get_last_value(request["get-last-value"])
+                        let responder = new SeaZMQResponder(request, ref.router_socket, ref.publisher, route_id)
+                        responder.send({"last-value": last_data})
+                    }else if(ref.commands[request.command] != undefined){
+                        let responder = new SeaZMQResponder(request, ref.router_socket, ref.publisher, route_id,this.router_address)
+                        ref.commands[request.command](responder)
+                    }
+                }catch(error){
+                    console.log(error)
+                    console.log("JSON error occured")
+                    let responder = new SeaZMQResponder("", this.router_socket, ref.publisher, route_id)
+                    responder.send({"error": "json error occurred"})
                 }
             }catch(error){
-                console.log(error)
-                console.log("JSON error occured")
+                await sleep(500)
+                if(error.errno == 11){
+                    console.log("poll-timeout")
+                }else{
+                    console.log(error)
+                }
             }
-        }).catch(function(error){
-            
-        }).finally(function(){
-            // after timeout, check if we should stop, if stop is needed, don't call loop to re-poll
-            if(ref.stop != true){
-                ref.listener()
-            }
-        })
+        }
     }
-    stop(){
+    stop_threads(){
         this.stop = true;
+        if(this.publisher != undefined){
+            this.publisher.lvc.stop_threads()
+        }
     }
 }
 
@@ -80,7 +108,7 @@ class SeaZMQResponder{
     request_data = undefined;
     socket = undefined;
     route_id = undefined
-    constructor(request_data, socket, route_id, publisher, lvc=undefined){
+    constructor(request_data, socket, publisher, route_id, lvc=undefined){
         this.request_data = request_data
         this.socket = socket
         this.route_id = route_id
@@ -144,6 +172,7 @@ class SeaZMQDealer{
         let promises = []
         if(definition.conn != undefined){
             ref.socket = new zmq.Dealer
+            ref.socket.receiveTimeout = this.socket_poll_timeout
             if(Array.isArray(definition.conn)){
                 for(let conn of definition.conn){
                     let promise = ref.socket.connect(conn)
@@ -160,66 +189,68 @@ class SeaZMQDealer{
             ref.listener()
         })
     }
-    listener(){
+    async listener(){
         let ref = this;
-        this.socket.receive().then(function(message){
+        console.log("Started dealer listener")
+        while(this.stop != true){
             try{
-                message = JSON.parse(message.toString("utf-8"))
-                if(message["subscribe-to"] != undefined){
-                    if(message["subscribe-topics"] != undefined){
-                        response = message["response"]
-                        topics = response["subscribe-topics"]
-                        response_obj = ref.response_router[message["transaction-id"]]
-                        for(topic of topics){
-                            ref.add_stream(response["subscribe-to"], topic, response_obj, response["lvc"])
+                let message = await _listener(ref.socket)
+                try{
+                    message = JSON.parse(message.toString("utf-8"))
+                    if(message["response"]["subscribe-to"] != undefined){
+                        if(message["response"]["subscribe-topics"] != undefined){
+                            let response = message["response"]
+                            let topics = response["subscribe-topics"]
+                            let response_obj = ref.response_router[message["transaction-id"]]
+                            for(let topic of topics){
+                                console.log("adding streams")
+                                console.log(topic)
+                                ref.add_stream(response["subscribe-to"], topic, response_obj, response["lvc"])
+                            }
                         }
+                    }else{
+                        ref.response_router[message["transaction-id"]].set_response(message)
                     }
-                }else{
-                    ref.response_router[message["transaction-id"]].set_response(message)
+                }catch(error){
+                    console.log(error)
+                    console.log("JSON error occured")
                 }
             }catch(error){
-                console.log(error)
-                console.log("JSON error occured")
+                if(error.errno == 11){
+                    console.log("poll-timeout")
+                }else{
+                    console.log(error.errno)
+                }
             }
-        }).catch(function(error){
-            
-        }).finally(function(){
             ref.set_timeouts()
-            // after timeout, check if we should stop, if stop is needed, don't call loop to re-poll
-            if(ref.stop != true){
-                ref.listener()
-            }
-        })
+        }
     }
-    add_stream(address, topic, subscriber, lvc){
+    async add_stream(address, topic, subscriber, lvc){
         let ref = this
         ADD_SUBSCRIBER_LOCK.acquire("", function(){
             if(GLOBAL_SUBSCRIBERS[address] == undefined){
                 GLOBAL_SUBSCRIBERS[address] = {}
             }
             if(GLOBAL_SUBSCRIBERS[address][topic] == undefined){
-                let socket = new zmq.socket("sub")
-                socket.connect(address)
-                socket.receiveTimeout = 1000
                 GLOBAL_SUBSCRIBERS[address][topic] = {
                     "subscribers": [subscriber],
                     "last-value": undefined,
                     "lock": new AsyncLock(),
                     "last-value-lock": new AsyncLock(),
                     "is-global": false,
-                    "socket": socket,
                 }
-                ref.stream_listener(address,topic,socket)
+                ref.stream_listener(address,topic)
             }else{
                 GLOBAL_SUBSCRIBERS[address][topic]["lock"].acquire("", function(){
                     GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].push(subscriber)
                 })
             }
-            ref.get_last_message(address, topic, subscriber, lvc)
+            sleep(10)
+            ref._get_last_value(address, topic, subscriber, lvc)
         })
     }
-    _update_subscribers(){
-        if(GLOBAL_SUBSCRIBERS["address"] != undefined){
+    _update_subscribers(address, topic, data){
+        if(GLOBAL_SUBSCRIBERS[address] != undefined){
             if(GLOBAL_SUBSCRIBERS[address][topic] != undefined){
                 ADD_SUBSCRIBER_LOCK.acquire("", function(){
                     GLOBAL_SUBSCRIBERS[address][topic]["lock"].acquire("", function(){
@@ -230,8 +261,8 @@ class SeaZMQDealer{
                                 GLOBAL_SUBSCRIBERS[address][topic].subscribers.splice(index, 1)
                                 if(GLOBAL_SUBSCRIBERS[address][topic].subscribers.length == 0){
                                     delete GLOBAL_SUBSCRIBERS[address][topic]
-                                    if(Object.keys(GLOBAL_SUBSCRIBERS[topic]).length == 0){
-                                        delete GLOBAL_SUBSCRIBERS[topic]
+                                    if(Object.keys(GLOBAL_SUBSCRIBERS[address]).length == 0){
+                                        delete GLOBAL_SUBSCRIBERS[address]
                                     }
                                     return
                                 }
@@ -245,17 +276,38 @@ class SeaZMQDealer{
             } 
         }
     }
-    async stream_listener(address,topic,socket){
+    async stream_listener(address,topic){
         let ref = this
-        socket.receive().then(function(message){
-            console.log("pub message", message)
-        }).catch(function(){
-            console.log("timeout occured in sub listener")
-        }).finally(function(){
-            if(ref.stop != true){
-                ref.stream_listener(address,topic,socket)
+        let socket = new zmq.Subscriber
+        socket.connect(address)
+        socket.subscribe(topic)
+        socket.receiveTimeout = 1000
+        GLOBAL_SUBSCRIBERS[address][topic]["socket"] = socket
+        while(ref.stop != true){
+            try{
+                let message = await _listener(socket)
+                message = message.toString("utf-8")
+                if(GLOBAL_SUBSCRIBERS[address] == undefined){
+                    return
+                }
+                if(GLOBAL_SUBSCRIBERS[address][topic] == undefined){
+                    return
+                }
+                let split = message.split(" ", 2)
+                let data = JSON.parse(split[1].toString("utf-8"))
+                this._update_subscribers(address, topic, data)
+            }catch(error){
+                if(error.errno == 11){
+                    console.log("poll-timeout")
+                }
+                if(GLOBAL_SUBSCRIBERS[address] == undefined){
+                    return
+                }
+                if(GLOBAL_SUBSCRIBERS[address][topic] == undefined){
+                    return
+                }
             }
-        })
+        }
     }
     async _get_last_value(address, topic, subscriber, lvc){
         let ref = this
@@ -265,17 +317,23 @@ class SeaZMQDealer{
                     if(GLOBAL_SUBSCRIBERS[address][topic]["last-value"] != undefined){
                         subscriber.update_stream(topic, GLOBAL_SUBSCRIBERS[address][topic]["last-value"])
                     }else{
-                        sea_dealer = SeaZMQDealer({conn: lvc})
-                        resp = sea_dealer.send({"get-last-value": topic})
+                        let sea_dealer = new SeaZMQDealer({conn: lvc})
+                        let resp = sea_dealer.send({"get-last-value": topic})
                         resp.on("response", function(data){
+                            console.log("received data")
+                            console.log(data)
                             if(data.response != undefined){
+                                console.log()
                                 if(data.response["last-value"] != undefined){
+                                    console.log("last value receieved")
                                     GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data["response"]["last-value"]
                                     subscriber.update_stream(topic, data["response"]["last-value"])
+                                }else{
+                                    console.log("last value not defined")
                                 }
                             }
+                            sea_dealer.stop_threads()
                         })
-                        sea_dealer.stop_threads()
                     }
                 })
             }
@@ -283,13 +341,13 @@ class SeaZMQDealer{
     }
     set_timeouts(){
         let ref = this;
-        this.timeout_array_lock.acquire("",function(){
+        ref.timeout_array_lock.acquire("",function(){
             let i = 0;
             while(i<ref.timeout_array.length){
                 if(ref.timeout_array[i][0] <= Date.now()){
                     ref.timeout_array[i][1].set_timed_out()
                     // remove transaction from available callbacks
-                    delete ref.response_router[ref.timeout_array[i][1].get_sent_data()["transaction-id"]]
+                    delete ref.response_router[ref.timeout_array[i][1].get_request()["transaction-id"]]
                 }else{
                     break
                 }
@@ -349,40 +407,51 @@ class SeaZMQDealer{
 
 class SeaZMQResponse extends EventEmitter{
     sent_data = {}
+    data = undefined
+    read_lock = new AsyncLock()
     stream_lock = new AsyncLock()
     stream = []
     last_topic_timestamp = {}
     closed = false
+    is_streaming = false
     response = undefined
-    get_sent_data(){
-        return this.sent_data
+    response_received = false
+    close(){
+        this.closed = true
+    }
+    set_streaming(){
+        this.is_streaming = true
     }
     set_sent_data(data){
         this.sent_data = data
     }
-    set_response(data){
-        this.response = data
-        this.emit("response", data)
-    }
     set_timed_out(){
-        if(!this.done){
+        if(this.response_received == false){
             let json = {
-                request: self.sent_data,
+                request: this.sent_data,
                 response: "timeout"
             }
             this.emit("timeout", json)
-            this.done = true
         }
     }
-    set_streaming(){
-        this.is_streaming = true
+    set_response(data){
+        let ref = this;
+        ref.read_lock.acquire("", function(){
+            if(ref.response_received != true){
+                if(data["transaction-id"] != undefined){
+                    delete data["transaction-id"]
+                }
+                ref.response_received = true
+                ref.emit("response", data)
+            }
+        })
     }
     update_stream(topic, data){
         let ref = this
         if(this.streaming == false){
             this.set_streaming()
         }
-        stream_lock.aquire("", function(){
+        this.stream_lock.acquire("", function(){
             if(data.timestamp != undefined){
                 if(ref.last_topic_timestamp[topic] >= data.timestamp){
                     return
@@ -394,6 +463,92 @@ class SeaZMQResponse extends EventEmitter{
             ref.emit("stream", data)
         })
     }
+    get_request(){
+        return this.sent_data
+    }
 }
+
+class SeaZMQPublisher{
+    send_lock = new AsyncLock()
+    cache_map = {}
+    socket = undefined
+    address = undefined
+    lvc = undefined
+    constructor(bind){
+        let ref = this
+        ref.socket = new zmq.Publisher
+        if(bind != undefined){
+            ref.socket_promise = ref.socket.bind(bind).then(function(){
+
+            }).catch(function(error){
+                console.log("error occured when binding to zmq sock")
+                console.log(error)
+            })
+            ref.lvc = new SeaZMQLVC(bind)
+        }else{
+            console.log("bind argument required for SeaZMQPublisher")
+        }
+    }
+    get_last_value(topic){
+        return this.lvc.cache_map[topic]
+    }
+    send_string(message){
+        let ref = this
+        this.send_lock.acquire("",function(){
+            ref.socket_promise.then(function(){
+                ref.socket.send(message)
+                console.log("message published")
+            })
+        })
+    }
+}
+
+class SeaZMQLVC{
+    cache_map = {}
+    stop = false
+    socket = undefined
+    constructor(sub_address){
+        let ref = this
+        this.socket = new zmq.Subscriber
+        this.socket.connect(sub_address)
+        ref.listen()
+        ref.socket.subscribe()
+        this.socket.receiveTimeout = 1000
+    }
+    async listen(){
+        while(!this.stop){
+            try{
+                let message = await _listener(this.socket)
+                try{
+                    let string_data = message.toString("utf-8")
+                    let split = string_data.split(" ", 2)
+                    let topic = split[0].toString("utf-8")
+                    let data = JSON.parse(split[1].toString("utf-8"))
+                    this.cache_map[topic] = data
+                    if(data["topic-end"] != undefined){
+                        this.cache_map[topic] = undefined
+                    }
+                    if(data["topic-start"] != undefined){
+                        this.cache_map[topic] = undefined
+                    }
+                }catch(error){
+                    console.log(error)
+                    console.log("error occurred when adding entry to lvc")
+                }
+            }catch(error){
+                if(error.errno == 11){
+                    console.log("poll-timeout")
+                }else if(!this.stop){
+                    console.log(error)
+                }
+            }
+        }
+    }
+    stop_threads(){
+        this.stop = true
+    }
+}
+
+
 
 module.exports = {SeaZMQResponder: SeaZMQResponder, SeaZMQResponse:SeaZMQResponse, SeaZMQDealer:SeaZMQDealer, SeaZMQRouter:SeaZMQRouter}
