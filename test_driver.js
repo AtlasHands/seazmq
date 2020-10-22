@@ -59,15 +59,15 @@ async function singletonProcessWithMultiSubscribers(){
         })
         test_in_progress = false
     }
-    let router = new seazmq.SeaZMQRouter({
-        "bind": "tcp://127.0.0.1:8000",
-        "publish": "tcp://127.0.0.1:8001",
+    let router = new seazmq.SeaZMQServer({
+        "router": "tcp://127.0.0.1:8000",
+        "publisher": "tcp://127.0.0.1:8001",
         "commands": {
             "start-test": start_test,
         }
     })
     
-    let dealer = new seazmq.SeaZMQDealer({"conn": "tcp://127.0.0.1:8000"})
+    let dealer = new seazmq.SeaZMQClient({"conn": "tcp://127.0.0.1:8000"})
     let client_1 = dealer.send({"command": "start-test"})
 
     client_1.on("response", function(message){
