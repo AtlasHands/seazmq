@@ -85,9 +85,12 @@ print("client_1", client_1.get_stream())
 
 client_2.stream_event.wait()
 print("client_2", client_2.get_stream())
+print("Done")
 # client_2 [{'data': {'stage-1': 'test-finish-success', 'stage-2': 'test-finish-failure'}, 'timestamp': 1602715623.5249596, 'topic': 'test-status'}]
 client_1.close()
 client_2.close()
+dealer.stop_threads()
+router.stop_threads()
 # client_1 {'response': 'Test Started', 'request': '{"command": "start-test", "transaction-id": 0}'}
 # client_1 [{'data': {'stage-1': 'started', 'stage-2': 'not started'}, 'timestamp': 1602715708.5011637, 'topic': 'test-status'}]
 # client_1 [{'data': {'light': 'yes', 'air': 'no'}, 'timestamp': 1602715708.5011637, 'topic': 'device-info'}]
