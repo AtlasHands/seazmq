@@ -34,9 +34,9 @@ class SeaZMQ:
         self.client_map = {}
         for key in client_map:
             if key == "self":
-                self.client_map[key] = SeaZMQRouter(client_map[key])
+                self.client_map[key] = SeaZMQServer(client_map[key])
             else:
-                self.client_map[key] = SeaZMQDealer(client_map[key])
+                self.client_map[key] = SeaZMQClient(client_map[key])
 
     def stop(self):
         """
@@ -46,7 +46,7 @@ class SeaZMQ:
             self.client_map[key].stop_threads()
 
 
-class SeaZMQRouter:
+class SeaZMQServer:
     """
     SeaZMQRouter is an encapsulation of the ZMQ ROUTER socket type, it provides a lookup for callbacks as well as
     passing a SeaZMQResponder object to the callback
@@ -57,17 +57,17 @@ class SeaZMQRouter:
         self.publisher = None
         self.router_address = ""
         # if bind is present
-        if "bind" in definition:
+        if "router" in definition:
             # setup zmq rep using the bind provided
             self.context = zmq.Context()
             self.router_socket = self.context.socket(zmq.ROUTER)
-            self.router_address = definition["bind"]
-            self.router_socket.bind(definition["bind"])
+            self.router_address = definition["router"]
+            self.router_socket.bind(definition["router"])
         else:
-            print("No bind argument found for REP type device")
+            print("No bind argument found for router type device")
             return
-        if "publish" in definition:
-            self.publisher = SeaZMQPublisher(definition["publish"])
+        if "publisher" in definition:
+            self.publisher = SeaZMQPublisher(definition["publisher"])
         # set this rep sockets commands
         self.commands = definition["commands"]
         # start listening thread
@@ -96,8 +96,13 @@ class SeaZMQRouter:
                     if "get-last-value" in data:
                         last_data = self.publisher.lvc.get_last_value(data["get-last-value"])
                         responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id)
-                        # if none gets turned into null
-                        responder.send({"last-value": last_data})
+                        # if the last data is a list of elements, use "last-values" key to indicate it needs to be
+                        # unpacked
+                        if not isinstance(last_data, list):
+                            # if none gets turned into null
+                            responder.send({"last-value": last_data})
+                        else:
+                            responder.send({"last-values": last_data})
                     # if callback exists, call it
                     elif self.commands[data["command"]] is not None:
                         # set up a responder so we can send it to whatever callback is assigned to this command
@@ -129,6 +134,7 @@ class SeaZMQResponder:
             :arg route_id: route_id given by router
         """
         self.request_data = request_data
+        self.publish_lock = threading.Lock()
         self.router_socket = router_socket
         self.publisher = publisher
         self.route_id = route_id
@@ -146,15 +152,24 @@ class SeaZMQResponder:
         else:
             self.send({"subscribe-to": address, "subscribe-topics": topics})
 
-    def publish(self, topic, data):
-        if self.publisher is not None:
+    def clear_sticky(self, topic, sticky_key):
+        with self.publish_lock:
             data_dict = {}
-            data_dict["data"] = data
-            if "timestamp" not in data_dict:
-                data_dict["timestamp"] = time.time()
+            data_dict["timestamp"] = time.time()
+            data_dict["clear-sticky"] = sticky_key
             self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
-        else:
-            print("Unable to publish event without a publisher defined")
+
+    def publish(self, topic, data, sticky_key=None):
+        with self.publish_lock:
+            if self.publisher is not None:
+                data_dict = {}
+                data_dict["data"] = data
+                if sticky_key is not None:
+                    data_dict["set-sticky"] = sticky_key
+                data_dict["timestamp"] = time.time()
+                self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
+            else:
+                print("Unable to publish event without a publisher defined")
 
     def send(self, data):
         """
@@ -173,7 +188,7 @@ class SeaZMQResponder:
 GLOBAL_SUBSCRIBERS = {}
 ADD_SUBSCRIBER_LOCK = threading.Lock()
 
-class SeaZMQDealer:
+class SeaZMQClient:
     """
     SeaZMQReq is a wrapper for the ZMQ DEALER socket type, this class handles connecting to a DEALER socket, iterating
     an internal counter for response tracking and caller forwarding
@@ -193,7 +208,7 @@ class SeaZMQDealer:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.DEALER)
         # the spec allows for multiple connections off a single dealer
-        if definition["conn"] is not None:
+        if "conn" in definition:
             if isinstance(definition["conn"], list):
                 for i in definition["conn"]:
                     self.socket.connect(i)
@@ -252,29 +267,32 @@ class SeaZMQDealer:
                 GLOBAL_SUBSCRIBERS[address][topic] = {
                     "subscribers": [subscriber],
                     "last-value": None,
+                    "sticky-values": {},
                     "lock": threading.Lock(),  # this lock is used when manipulating subscribers/sending to subscribers
                     "last-value-lock": threading.Lock(),
                     "is-global": False,  # global listeners don't need subscribers to remain live
                 }
                 start_stream_listener = threading.Thread(target=self.stream_listener, args=[address, topic])
                 start_stream_listener.start()
-                sub_initialization = True
             else:
                 with GLOBAL_SUBSCRIBERS[address][topic]["lock"]:
                     GLOBAL_SUBSCRIBERS[address][topic]["subscribers"].append(subscriber)
 
-        if sub_initialization:
-            time.sleep(.005)
         # every subscriber needs to get last message regardless of if a request is required
         get_last_message = threading.Thread(target=self._get_last_value, args=[address, topic, subscriber, lvc])
         get_last_message.start()
 
     def _update_subscribers(self, address, topic, data):
+        global GLOBAL_SUBSCRIBERS
+        subscribers = GLOBAL_SUBSCRIBERS
         if address in GLOBAL_SUBSCRIBERS:
             if topic in GLOBAL_SUBSCRIBERS[address]:
                 with ADD_SUBSCRIBER_LOCK:
-                    with GLOBAL_SUBSCRIBERS[address][topic]["lock"]:
-                        GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data
+                    with GLOBAL_SUBSCRIBERS[address][topic]["last-value-lock"]:
+                        if "set-sticky" in data:
+                            GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"][data["set-sticky"]] = data
+                        else:
+                            GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data
                         index = 0
                         while index < len(GLOBAL_SUBSCRIBERS[address][topic]["subscribers"]):
                             # print("Updating subscribers")
@@ -315,7 +333,14 @@ class SeaZMQDealer:
                     data = sub_socket.recv_string()
                     split = data.split(" ", 1)
                     json_data = json.loads(split[1])
-                    self._update_subscribers(address, topic, json_data)
+                    # clear-sticky messages should not be added
+                    if "clear-sticky" in data:
+                        print("clear sticky heard")
+                        with GLOBAL_SUBSCRIBERS[address][topic]["last-value-lock"]:
+                            if data["clear-sticky"] in GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"]:
+                                del GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"][data["clear-sticky"]]
+                    else:
+                        self._update_subscribers(address, topic, json_data)
             except:
                 return
 
@@ -325,11 +350,17 @@ class SeaZMQDealer:
         if address in GLOBAL_SUBSCRIBERS:
             if topic in GLOBAL_SUBSCRIBERS[address]:
                 with GLOBAL_SUBSCRIBERS[address][topic]["last-value-lock"]:
+                    last_values_local = False
                     # last value lock will release and give the next getter the last value if received
                     if GLOBAL_SUBSCRIBERS[address][topic]["last-value"] is not None:
                         subscriber.update_stream(topic, GLOBAL_SUBSCRIBERS[address][topic]["last-value"])
-                    else:
-                        sea_dealer = SeaZMQDealer({"conn": lvc})
+                        last_values_local = True
+                    if len(GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"]):
+                        for _, v in GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"].items():
+                            subscriber.update_stream(topic, v, False)
+                        last_values_local = True
+                    if not last_values_local:
+                        sea_dealer = SeaZMQClient({"conn": lvc})
                         # change to send to address and topic of sub
                         resp = sea_dealer.send({"get-last-value": topic})
                         while not self.stop.is_set():
@@ -338,8 +369,24 @@ class SeaZMQDealer:
                                 if has_data != 0:
                                     data = resp.get_response()
                                     if "last-value" in data:
-                                        GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data["last-value"]
+                                        if data["last-value"] is None:
+                                            sea_dealer.stop_threads()
+                                            return
+                                        if "set-sticky" in data["last-value"]:
+                                            GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"][data["last-value"]["set-sticky"]] = data["last-value"]
+                                        else:
+                                            GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data["last-value"]
                                         subscriber.update_stream(topic, data["last-value"])
+                                    if "last-values" in data:
+                                        print("in-last-values")
+                                        print(data)
+                                        for last_value in data["last-values"]:
+                                            if "set-sticky" in last_value:
+                                                GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"][
+                                                        last_value["set-sticky"]] = last_value
+                                            else:
+                                                GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = last_value
+                                            subscriber.update_stream(topic, last_value, False)
                                     sea_dealer.stop_threads()
                                     return
                             except:
@@ -467,7 +514,7 @@ class SeaZMQResponse:
     def set_streaming(self):
         self.is_streaming = True
 
-    def update_stream(self, topic, data):
+    def update_stream(self, topic, data, enforce_order=True):
         if not self.is_streaming:
             self.set_streaming()
         if self.closed:
@@ -476,19 +523,27 @@ class SeaZMQResponse:
             if "timestamp" in data:
                 # old message
                 if topic in self.last_topic_timestamp:
-                    if self.last_topic_timestamp[topic] >= data["timestamp"]:
-                        # print("Old Message")
-                        return
-                    else:
-                        self.last_topic_timestamp[topic] = data["timestamp"]
+                    if enforce_order:
+                        if self.last_topic_timestamp[topic] >= data["timestamp"]:
+                            # print("Old Message")
+                            return
+                        else:
+                            self.last_topic_timestamp[topic] = data["timestamp"]
                 else:
                     self.last_topic_timestamp[topic] = data["timestamp"]
             data["topic"] = topic
             self.stream.append(data)
             self.stream_event.set()
 
+    def _get_timestamp(self, elem):
+        if "timestamp" in elem:
+            return elem["timestamp"]
+        else:
+            return 0
+
     def get_stream(self, reset_event=True):
         with self.stream_lock:
+            self.stream.sort(key=self._get_timestamp)
             stream = copy.deepcopy(self.stream)
             self.stream = []
             if reset_event is True:
@@ -542,6 +597,7 @@ class SeaZMQPublisher:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.bind(bind)
+        self.socket.setsockopt(zmq.RECOVERY_IVL, 0)
         self.address = bind
         self.lvc = SeaZMQLVC(bind)
 
@@ -561,8 +617,10 @@ class SeaZMQPublisher:
 
 
 class SeaZMQLVC:
-    def __init__(self, sub_address):
+    def __init__(self, sub_address=None):
         self.cache_map = {}
+        self.sticky_cache_map = {}
+        self.sticky_lock = threading.Lock()
         self.stop = False
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
@@ -573,10 +631,25 @@ class SeaZMQLVC:
         thread.start()
 
     def get_last_value(self, topic):
+        return_arr = []
+        # get data with sticky_lock
+        with self.sticky_lock:
+            if topic in self.sticky_cache_map:
+                for k, v in self.sticky_cache_map[topic].items():
+                    return_arr.append(v)
+
         if topic in self.cache_map:
-            return self.cache_map[topic]
-        else:
+            return_arr.append(self.cache_map[topic])
+
+        # return nothing if length of array is 0
+        if len(return_arr) == 0:
             return None
+        # return the element if length of array is 1 (array unpack handling)
+        elif len(return_arr) == 1:
+            return return_arr[0]
+        # return the array (will set unpack=true in stream handling)
+        else:
+            return return_arr
 
     def listen(self):
         while not self.stop:
@@ -591,7 +664,28 @@ class SeaZMQLVC:
                         self.cache_map[topic] = None
                     if "topic-start" in data:
                         self.cache_map[topic] = None
-                    self.cache_map[topic] = data
+                    if "clear-sticky" in data:
+                        # lock when mutating sticky
+                        with self.sticky_lock:
+                            # if the sticky key exists delete it
+                            if topic in self.sticky_cache_map:
+                                if data["clear-sticky"] in self.sticky_cache_map[topic]:
+                                    del self.sticky_cache_map[topic][data["clear-sticky"]]
+                                #  if our sticky topic is now empty delete it
+                                if len(self.sticky_cache_map[topic]) == 0:
+                                    del self.sticky_cache_map[topic]
+                    else:
+                        if "set-sticky" in data:
+                            # lock when mutating sticky
+                            with self.sticky_lock:
+                                # only need to check if dict is in the topic
+                                if topic not in self.sticky_cache_map:
+                                    self.sticky_cache_map[topic] = {}
+                                # assign the key to the data
+                                self.sticky_cache_map[topic][data["set-sticky"]] = data
+                        else:
+                            # last non-sticky message
+                            self.cache_map[topic] = data
             except:
                 if self.stop is not True:
                     print("Unknown ZMQ error occurred")
