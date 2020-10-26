@@ -104,11 +104,16 @@ class SeaZMQServer:
                         else:
                             responder.send({"last-values": last_data})
                     # if callback exists, call it
-                    elif self.commands[data["command"]] is not None:
+                    elif data["command"] in self.commands:
                         # set up a responder so we can send it to whatever callback is assigned to this command
-                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id, self.router_address)
+                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id,
+                                                    self.router_address)
                         callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
                         callback_thread.start()
+                    else:
+                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id,
+                                                    self.router_address)
+                        responder.send("Server did not understand the request")
             except zmq.error.ZMQError:
                 return
 
