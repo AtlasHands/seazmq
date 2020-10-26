@@ -378,8 +378,6 @@ class SeaZMQClient:
                                             GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = data["last-value"]
                                         subscriber.update_stream(topic, data["last-value"])
                                     if "last-values" in data:
-                                        print("in-last-values")
-                                        print(data)
                                         for last_value in data["last-values"]:
                                             if "set-sticky" in last_value:
                                                 GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"][
