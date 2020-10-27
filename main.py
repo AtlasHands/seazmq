@@ -288,8 +288,6 @@ class SeaZMQClient:
         get_last_message.start()
 
     def _update_subscribers(self, address, topic, data):
-        global GLOBAL_SUBSCRIBERS
-        subscribers = GLOBAL_SUBSCRIBERS
         if address in GLOBAL_SUBSCRIBERS:
             if topic in GLOBAL_SUBSCRIBERS[address]:
                 with ADD_SUBSCRIBER_LOCK:
@@ -536,6 +534,9 @@ class SeaZMQResponse:
                     self.last_topic_timestamp[topic] = data["timestamp"]
             data["topic"] = topic
             self.stream.append(data)
+            # shift off first element to prevent using too much memory (typically won't happen)
+            if len(self.stream) > 1000:
+                self.stream = self.stream[1:]
             self.stream_event.set()
 
     def _get_timestamp(self, elem):
