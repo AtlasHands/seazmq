@@ -615,6 +615,15 @@ class SeaZMQPublisher:
             for i in range(topics):
                 self.socket.send_string("%s %s", i, json.dumps({"topic-end: true"}))
 
+    def publish(self, topic, data, sticky_key=None):
+        with self.send_lock:
+            data_dict = {}
+            data_dict["data"] = data
+            if sticky_key is not None:
+                data_dict["set-sticky"] = sticky_key
+            data_dict["timestamp"] = time.time()
+            self.send_string("%s %s" % (topic, json.dumps(data_dict)))
+
     def send_string(self, message):
         with self.send_lock:
             self.socket.send_string(message)
