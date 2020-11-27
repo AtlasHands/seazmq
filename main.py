@@ -112,7 +112,6 @@ class SeaZMQServer:
                         # set up a responder so we can send it to whatever callback is assigned to this command
                         responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id,
                                                     self.router_address, json=self.json)
-                        responder.json_settings 
                         callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
                         callback_thread.start()
                     else:
@@ -168,7 +167,7 @@ class SeaZMQResponder:
             data_dict = {}
             data_dict["timestamp"] = time.time()
             data_dict["clear-sticky"] = sticky_key
-            self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict), **self.json))
+            self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict, **self.json)))
 
     def publish(self, topic, data, sticky_key=None):
         with self.publish_lock:
