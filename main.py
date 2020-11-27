@@ -55,6 +55,7 @@ class SeaZMQServer:
         # set up stopping
         self.stop = False
         self.publisher = None
+        self.json = {}
         self.router_address = ""
         # if bind is present
         if "router" in definition:
@@ -68,6 +69,9 @@ class SeaZMQServer:
             return
         if "publisher" in definition:
             self.publisher = SeaZMQPublisher(definition["publisher"])
+        if "json" in definition:
+            self.json = definition["json"]
+            self.publisher.json = definition["json"]
         # set this rep sockets commands
         self.commands = definition["commands"]
         # start listening thread
@@ -95,7 +99,7 @@ class SeaZMQServer:
                     # get last data provides a topic to get data from
                     if "get-last-value" in data:
                         last_data = self.publisher.lvc.get_last_value(data["get-last-value"])
-                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id)
+                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id, json=self.json)
                         # if the last data is a list of elements, use "last-values" key to indicate it needs to be
                         # unpacked
                         if not isinstance(last_data, list):
@@ -107,7 +111,8 @@ class SeaZMQServer:
                     elif data["command"] in self.commands:
                         # set up a responder so we can send it to whatever callback is assigned to this command
                         responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id,
-                                                    self.router_address)
+                                                    self.router_address, json=self.json)
+                        responder.json_settings 
                         callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
                         callback_thread.start()
                     else:
@@ -130,7 +135,7 @@ class SeaZMQResponder:
     """
     SeaZMQResponder handles providing an easy object interface for communicating with a requester
     """
-    def __init__(self, request_data, router_socket, publisher, route_id, lvc=None):
+    def __init__(self, request_data, router_socket, publisher, route_id, lvc=None, json=None):
         """
             Initialize data needed to send a packet back to the sender.
 
@@ -139,6 +144,7 @@ class SeaZMQResponder:
             :arg route_id: route_id given by router
         """
         self.request_data = request_data
+        self.json = json
         self.publish_lock = threading.Lock()
         self.router_socket = router_socket
         self.publisher = publisher
@@ -162,7 +168,7 @@ class SeaZMQResponder:
             data_dict = {}
             data_dict["timestamp"] = time.time()
             data_dict["clear-sticky"] = sticky_key
-            self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
+            self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict), **self.json))
 
     def publish(self, topic, data, sticky_key=None):
         with self.publish_lock:
@@ -172,7 +178,7 @@ class SeaZMQResponder:
                 if sticky_key is not None:
                     data_dict["set-sticky"] = sticky_key
                 data_dict["timestamp"] = time.time()
-                self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict)))
+                self.publisher.send_string("%s %s" % (topic, json.dumps(data_dict, **self.json)))
             else:
                 print("Unable to publish event without a publisher defined")
 
@@ -187,7 +193,7 @@ class SeaZMQResponder:
         response_dict["transaction-id"] = transaction_id
         response_dict["response"] = data
         # router requires the route id to be 0 frame of multipart
-        self.router_socket.send_multipart([self.route_id, bytes(json.dumps(response_dict), "utf-8")])
+        self.router_socket.send_multipart([self.route_id, bytes(json.dumps(response_dict, **self.json), "utf-8")])
 
 
 GLOBAL_SUBSCRIBERS = {}
@@ -598,6 +604,7 @@ class SeaZMQPublisher:
         # cache_map
         self.send_lock = threading.Lock()
         self.cache_map = {}
+        self.json = {}
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.bind(bind)
@@ -608,12 +615,12 @@ class SeaZMQPublisher:
     def send_start_topic(self, topics):
         with self.send_lock:
             for i in range(topics):
-                self.socket.send_string("%s %s", i, json.dumps({"topic-start: true"}))
+                self.socket.send_string("%s %s", i, json.dumps({"topic-start: true"}, **self.json))
 
     def send_end_topic(self, topics):
         with self.send_lock:
             for i in range(topics):
-                self.socket.send_string("%s %s", i, json.dumps({"topic-end: true"}))
+                self.socket.send_string("%s %s", i, json.dumps({"topic-end: true"}, **self.json))
 
     def publish(self, topic, data, sticky_key=None):
         data_dict = {}
@@ -621,7 +628,7 @@ class SeaZMQPublisher:
         if sticky_key is not None:
             data_dict["set-sticky"] = sticky_key
         data_dict["timestamp"] = time.time()
-        self.send_string("%s %s" % (topic, json.dumps(data_dict)))
+        self.send_string("%s %s" % (topic, json.dumps(data_dict, **self.json)))
 
     def send_string(self, message):
         with self.send_lock:
