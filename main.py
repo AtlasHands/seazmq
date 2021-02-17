@@ -61,9 +61,7 @@ class SeaZMQServer:
         if "router" in definition:
             # setup zmq rep using the bind provided
             self.context = zmq.Context()
-            self.router_socket = self.context.socket(zmq.ROUTER)
             self.router_address = definition["router"]
-            self.router_socket.bind(definition["router"])
         else:
             print("No bind argument found for router type device")
             return
@@ -83,43 +81,54 @@ class SeaZMQServer:
         Listener that listens for incoming requests from a dealer
         """
         # listen until signaled to stop
+        router = RouterSocket(self.router_address)
         while not self.stop:
             try:
+                router.recv_event.wait(1)
                 # poll for data (safe for not thread blocking forever, and then never stopping)
-                has_data = self.router_socket.poll(1000)
-                # == 0 if no data is present
-                if has_data != 0:
-                    # recv route and json
-                    try:
-                        route_id, json_data = self.router_socket.recv_multipart()
-                    except ValueError:
-                        print("Error Unpacking data, dealer socket may not be in use")
-                    # turn json into dict
-                    data = json.loads(json_data)
-                    # get last data provides a topic to get data from
-                    if "get-last-value" in data:
-                        last_data = self.publisher.lvc.get_last_value(data["get-last-value"])
-                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id, json=self.json)
-                        # if the last data is a list of elements, use "last-values" key to indicate it needs to be
-                        # unpacked
-                        if not isinstance(last_data, list):
-                            # if none gets turned into null
-                            responder.send({"last-value": last_data})
-                        else:
-                            responder.send({"last-values": last_data})
-                    # if callback exists, call it
-                    elif data["command"] in self.commands:
-                        # set up a responder so we can send it to whatever callback is assigned to this command
-                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id,
-                                                    self.router_address, json=self.json)
-                        callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
-                        callback_thread.start()
-                    else:
-                        responder = SeaZMQResponder(data, self.router_socket, self.publisher, route_id,
-                                                    self.router_address)
-                        responder.send("Server did not understand the request")
+                if router.recv_event.isSet():
+                    handle_thread = threading.Thread(target=self._handle_request, args=[router])
+                    handle_thread.start()
+
             except zmq.error.ZMQError:
                 return
+        router.stop()
+
+    def _handle_request(self, router):
+        # recv json
+        data = {}
+        try:
+            recv = router.get_recv()
+            route_id = recv[0]
+            json_data = recv[1]
+            # turn json into dict
+            data = json.loads(json_data)
+        except:
+            print("json loading error")
+
+
+        # get last data provides a topic to get data from
+        if "get-last-value" in data:
+            last_data = self.publisher.lvc.get_last_value(data["get-last-value"])
+            responder = SeaZMQResponder(data, router, route_id, self.publisher, json=self.json)
+            # if the last data is a list of elements, use "last-values" key to indicate it needs to be
+            # unpacked
+            if not isinstance(last_data, list):
+                # if none gets turned into null
+                responder.send({"last-value": last_data})
+            else:
+                responder.send({"last-values": last_data})
+        # if callback exists, call it
+        elif data["command"] in self.commands:
+            # set up a responder so we can send it to whatever callback is assigned to this command
+            responder = SeaZMQResponder(data, router, route_id, self.publisher,
+                                        self.router_address, json=self.json)
+            callback_thread = threading.Thread(target=self.commands[data["command"]], args=[responder])
+            callback_thread.start()
+        else:
+            responder = SeaZMQResponder(data, router, route_id, self.publisher,
+                                        self.router_address)
+            responder.send("Server did not understand the request")
 
     def stop_threads(self):
         """
@@ -134,7 +143,7 @@ class SeaZMQResponder:
     """
     SeaZMQResponder handles providing an easy object interface for communicating with a requester
     """
-    def __init__(self, request_data, router_socket, publisher, route_id, lvc=None, json=None):
+    def __init__(self, request_data, rep_socket, route_id, publisher, lvc=None, json=None):
         """
             Initialize data needed to send a packet back to the sender.
 
@@ -145,9 +154,9 @@ class SeaZMQResponder:
         self.request_data = request_data
         self.json = json
         self.publish_lock = threading.Lock()
-        self.router_socket = router_socket
-        self.publisher = publisher
+        self.rep_socket = rep_socket
         self.route_id = route_id
+        self.publisher = publisher
         self.lvc = lvc
 
     def get_data(self):
@@ -192,7 +201,7 @@ class SeaZMQResponder:
         response_dict["transaction-id"] = transaction_id
         response_dict["response"] = data
         # router requires the route id to be 0 frame of multipart
-        self.router_socket.send_multipart([self.route_id, bytes(json.dumps(response_dict, **self.json), "utf-8")])
+        self.rep_socket.send_multipart(self.route_id, bytes(json.dumps(response_dict, **self.json), "utf-8"))
 
 
 GLOBAL_SUBSCRIBERS = {}
@@ -487,7 +496,7 @@ class SeaZMQClient:
             if self.counter > self.max_transaction_count:
                 self.counter = 0
 
-        self.socket.send_string(json_data)
+            self.socket.send_string(json_data)
         return response_obj
 
 
@@ -712,3 +721,130 @@ class SeaZMQLVC:
     def stop_threads(self):
         self.stop = True
         self.context.destroy(True)
+
+
+# router socket, created because of issues with uncatchable threading errors
+class RouterSocket:
+    def __init__(self, addr):
+        self.addr = addr
+        # internally holds data ready to send
+        self.send_data = []
+        # lock for mutating the send_data
+        self.send_lock = threading.Lock()
+        # holds data that has been received
+        self.recv = []
+        # locks the above recv data when mutating
+        self.recv_lock = threading.Lock()
+        # should the threads be stopped
+        self.stop_threads = False
+        # recv event has been processed
+        self.recv_cleared = threading.Event()
+        # initially we have no recv, set recv_cleared
+        self.recv_cleared.set()
+        # lock for checking/mutating the state of events
+        self.event_lock = threading.Lock()
+        # is there an event currently? gets cleared when event_count == 0
+        self.has_event = threading.Event()
+        # is there a recv event
+        self.has_recv = threading.Event()
+        # is there a send event
+        self.has_send = threading.Event()
+        # external recv_event that implementors use
+        self.recv_event = threading.Event()
+        # thread that listens to the socket
+        self.s_thread = threading.Thread(target=self._socket_listener)
+        self.s_thread.start()
+
+    def stop(self):
+        self.stop_threads = True
+
+    # external callers can pop an element off of the current available received data
+    def get_recv(self):
+        data = None
+        with self.recv_lock:
+            if len(self.recv) != 0:
+                data = self.recv[0]
+            if len(self.recv) == 1:
+                self.recv = []
+                self.recv_event.clear()
+            else:
+                self.recv = self.recv[1:]
+        return data
+
+    # listen to the socket (and handle everything) in one thread
+    def _socket_listener(self):
+        # init router socket
+        ctx = zmq.Context.instance()
+        rep = ctx.socket(zmq.ROUTER)
+        rep.bind(self.addr)
+        # start the recv thread which will notify this thread if there are recv events
+        recv_thread = threading.Thread(target=self._recv_listener, args=[rep])
+        recv_thread.start()
+        # while not told to stop
+        while not self.stop_threads:
+            # wait on the has_event event
+            self.has_event.wait(1)
+            # if it is set
+            if self.has_event.is_set():
+                # check if the socket has available sends
+                if self.has_send.is_set():
+                    # with the sending lock
+                    with self.send_lock:
+                        # copy the send data, and set the queue to be empty
+                        send_data = copy.copy(self.send_data)
+                        self.send_data = []
+                        # send all the current queue
+                        for data in send_data:
+                            rep.send_multipart(data)
+                        # remove the corresponding number of events
+                        with self.event_lock:
+                            self.has_send.clear()
+
+                if self.has_recv.is_set():
+                    # 0.1ms poll check for data - trying to get all available data on rep and then relax to let sends
+                    # get through
+                    count = 0
+                    has_data = rep.poll(0.1)
+                    while has_data != 0:
+                        with self.recv_lock:
+                            self.recv.append(rep.recv_multipart())
+                            self.recv_event.set()
+                            count += 1
+                        has_data = rep.poll(0.1)
+                    with self.event_lock:
+                        self.recv_cleared.set()
+                        self.has_recv.clear()
+
+                with self.event_lock:
+                    if not self.has_send.is_set() and not self.has_recv.is_set():
+                        self.has_event.clear()
+
+    # just initing this thread with the socket just in case it is safer: http://api.zeromq.org/3-2:zmq#toc4
+    def _recv_listener(self, socket):
+        while not self.stop_threads:
+            # if has_recv is set (was already set by below code)
+            if self.has_recv.is_set():
+                # wait on the recv_cleared event
+                self.recv_cleared.wait(1)
+            # if the recv set is cleared (done on init, also done when recv finishes processing)
+            if self.recv_cleared.is_set():
+                # poll the socket
+                has_data = socket.poll(1000)
+                # if there is data
+                if has_data != 0:
+                    # clear the recv cleared event, set the recv event and the events event
+                    with self.event_lock:
+                        self.recv_cleared.clear()
+                        self.has_recv.set()
+                        self.has_event.set()
+
+    def send_multipart(self, route, data):
+        # with the send lock
+        with self.send_lock:
+            # append the data
+            self.send_data.append([route, data])
+        # with the event lock, set the send events
+        with self.event_lock:
+            self.has_send.set()
+            self.has_event.set()
+

@@ -50,9 +50,7 @@ router = SeaZMQServer({
 
 dealer = SeaZMQClient({"conn": "tcp://127.0.0.1:8000"})
 client_1 = dealer.send({"command": "start-test"})
-
 # unwrapped for easier print viewing.
-
 client_1.response_event.wait()
 print("client_1", client_1.get_response())
 
@@ -61,7 +59,7 @@ print("client_1", client_1.get_stream())
 client_1.stream_event.wait()
 print("client_1", client_1.get_stream())
 
-
+time.sleep(5)
 client_2 = dealer.send({"command": "start-test"})
 
 client_2.response_event.wait()
