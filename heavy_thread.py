@@ -2,7 +2,7 @@ from main import *
 
 
 def ping(ctx:SeaZMQResponder):
-    ctx.send("fuck")
+    ctx.send("ping")
 
 
 router = SeaZMQServer({

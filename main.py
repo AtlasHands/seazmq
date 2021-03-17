@@ -127,7 +127,7 @@ class SeaZMQServer:
             callback_thread.start()
         else:
             responder = SeaZMQResponder(data, router, route_id, self.publisher,
-                                        self.router_address)
+                                        self.router_address, json=self.json)
             responder.send("Server did not understand the request")
 
     def stop_threads(self):
@@ -152,7 +152,10 @@ class SeaZMQResponder:
             :arg route_id: route_id given by router
         """
         self.request_data = request_data
-        self.json = json
+        if json == None:
+            self.json = {}
+        else:
+            self.json = json
         self.publish_lock = threading.Lock()
         self.rep_socket = rep_socket
         self.route_id = route_id
