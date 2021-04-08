@@ -606,7 +606,10 @@ class SeaZMQResponse:
         with self.read_lock:
             if self.data is not None:
                 if "response" in self.data:
-                    return self.data["response"]
+                    if self.data["response"] == "timeout":
+                        return {}, "timeout"
+                    else:
+                        return self.data["response"], None
 
 
 # simple wrapper for publisher socket that creates an LVC
