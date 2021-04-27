@@ -43,7 +43,7 @@ class SeaZMQ:
         Send signal to stop all active threads
         """
         for key in self.client_map:
-            self.client_map[key].stop_threads()
+            self.client_map[key].stop()
 
 
 class SeaZMQServer:
@@ -53,7 +53,7 @@ class SeaZMQServer:
     """
     def __init__(self, definition):
         # set up stopping
-        self.stop = False
+        self.stop_threads = False
         self.publisher = None
         self.json = {}
         self.router_address = ""
@@ -76,13 +76,19 @@ class SeaZMQServer:
         listener = threading.Thread(target=self.listener)
         listener.start()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
     def listener(self):
         """
         Listener that listens for incoming requests from a dealer
         """
         # listen until signaled to stop
         router = RouterSocket(self.router_address)
-        while not self.stop:
+        while not self.stop_threads:
             try:
                 router.recv_event.wait(1)
                 # poll for data (safe for not thread blocking forever, and then never stopping)
@@ -130,13 +136,16 @@ class SeaZMQServer:
                                         self.router_address, json=self.json)
             responder.send("Server did not understand the request")
 
-    def stop_threads(self):
+    def stop(self):
         """
             Send signal to stop all active threads
         """
-        self.stop = True
-        self.publisher.lvc.stop_threads()
-        self.context.destroy(True)
+        try:
+            self.stop_threads = True
+            self.publisher.lvc.stop()
+            self.context.destroy(True)
+        except:
+            pass
 
 
 class SeaZMQResponder:
@@ -218,7 +227,7 @@ class SeaZMQClient:
     def __init__(self, definition: dict, max_transaction_count=10000):
         # May have to have a start delay in the init
         self.counter = 0
-        self.stop = threading.Event()
+        self.stop_event = threading.Event()
         # sorted array of upcoming timeouts
         self.timeout_array = []
         # lock for adding timeouts/checking timeouts
@@ -242,18 +251,27 @@ class SeaZMQClient:
         listener = threading.Thread(target=self.response_listener)
         listener.start()
 
-    def stop_threads(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        self.stop()
+
+    def stop(self):
         """
             Send signal to stop all active threads
         """
-        self.stop.set()
-        self.context.destroy(True)
+        try:
+            self.stop_event.set()
+            self.context.destroy(True)
+        except:
+            pass
 
     def response_listener(self):
         """
         Listen for responses from sent out transaction-id's
         """
-        while not self.stop.is_set():
+        while not self.stop_event.is_set():
             try:
                 # check if we have a any data (thread safe)
                 has_response = self.socket.poll(1000)
@@ -340,7 +358,7 @@ class SeaZMQClient:
         # subscribe to topic
         sub_socket.subscribe(topic)
         GLOBAL_SUBSCRIBERS[address][topic]["socket"] = sub_socket
-        while not self.stop.is_set():
+        while not self.stop_event.is_set():
             try:
                 has_data = sub_socket.poll(1000)  # prevent thread locking in case of requested stop
                 # handle removing listeners with no object
@@ -383,14 +401,14 @@ class SeaZMQClient:
                         sea_dealer = SeaZMQClient({"conn": lvc})
                         # change to send to address and topic of sub
                         resp = sea_dealer.send({"get-last-value": topic})
-                        while not self.stop.is_set():
+                        while not self.stop_event.is_set():
                             try:
                                 has_data = resp.response_event.wait(1)
                                 if has_data != 0:
                                     data = resp.get_response()
                                     if "last-value" in data:
                                         if data["last-value"] is None:
-                                            sea_dealer.stop_threads()
+                                            sea_dealer.stop()
                                             return
                                         if "set-sticky" in data["last-value"]:
                                             GLOBAL_SUBSCRIBERS[address][topic]["sticky-values"][data["last-value"]["set-sticky"]] = data["last-value"]
@@ -405,10 +423,10 @@ class SeaZMQClient:
                                             else:
                                                 GLOBAL_SUBSCRIBERS[address][topic]["last-value"] = last_value
                                             subscriber.update_stream(topic, last_value, False)
-                                    sea_dealer.stop_threads()
+                                    sea_dealer.stop()
                                     return
                             except:
-                                sea_dealer.stop_threads()
+                                sea_dealer.stop()
                                 return
 
     def set_timeouts(self):
@@ -524,6 +542,7 @@ class SeaZMQResponse:
         # the holder for the data
         self.data = None
         self.closed = False
+        self.timed_out = False
         self.is_streaming = False
 
     def close(self):
@@ -575,11 +594,7 @@ class SeaZMQResponse:
         with self.read_lock:
             # request not finished before timeout invalidation, don't trigger timeout if streaming
             if not self.response_event.is_set() and not self.is_streaming:
-                dict = {
-                    "request": self.sent_data,
-                    "response": "timeout",
-                }
-                self.data = dict
+                self.timed_out = True
                 self.response_event.set()
 
     def set_data(self, data: dict):
@@ -606,7 +621,7 @@ class SeaZMQResponse:
         with self.read_lock:
             if self.data is not None:
                 if "response" in self.data:
-                    if self.data["response"] == "timeout":
+                    if self.timed_out is True:
                         return {}, "timeout"
                     else:
                         return self.data["response"], None
@@ -654,7 +669,7 @@ class SeaZMQLVC:
         self.cache_map = {}
         self.sticky_cache_map = {}
         self.sticky_lock = threading.Lock()
-        self.stop = False
+        self.stop_event = False
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.connect(sub_address)
@@ -685,7 +700,7 @@ class SeaZMQLVC:
             return return_arr
 
     def listen(self):
-        while not self.stop:
+        while not self.stop_event:
             try:
                 has_results = self.socket.poll(1000)
                 if has_results:
@@ -720,12 +735,12 @@ class SeaZMQLVC:
                             # last non-sticky message
                             self.cache_map[topic] = data
             except:
-                if self.stop is not True:
+                if self.stop_event is not True:
                     print("Unknown ZMQ error occurred")
                 return
 
-    def stop_threads(self):
-        self.stop = True
+    def stop(self):
+        self.stop_event = True
         self.context.destroy(True)
 
 
@@ -742,7 +757,7 @@ class RouterSocket:
         # locks the above recv data when mutating
         self.recv_lock = threading.Lock()
         # should the threads be stopped
-        self.stop_threads = False
+        self.stop_event = False
         # recv event has been processed
         self.recv_cleared = threading.Event()
         # initially we have no recv, set recv_cleared
@@ -762,7 +777,7 @@ class RouterSocket:
         self.s_thread.start()
 
     def stop(self):
-        self.stop_threads = True
+        self.stop_event = True
 
     # external callers can pop an element off of the current available received data
     def get_recv(self):
@@ -787,7 +802,7 @@ class RouterSocket:
         recv_thread = threading.Thread(target=self._recv_listener, args=[rep])
         recv_thread.start()
         # while not told to stop
-        while not self.stop_threads:
+        while not self.stop_event:
             # wait on the has_event event
             self.has_event.wait(1)
             # if it is set
@@ -827,7 +842,7 @@ class RouterSocket:
 
     # just initing this thread with the socket just in case it is safer: http://api.zeromq.org/3-2:zmq#toc4
     def _recv_listener(self, socket):
-        while not self.stop_threads:
+        while not self.stop_event:
             # if has_recv is set (was already set by below code)
             if self.has_recv.is_set():
                 # wait on the recv_cleared event

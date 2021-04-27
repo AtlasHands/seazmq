@@ -22,7 +22,7 @@ def send_thread(num):
         t = threading.Thread(target=client_send_thread, args=[client, num, i])
         t.start()
     time.sleep(5)
-    client.stop_threads()
+    client.stop()
 
 def client_send_thread(sock, num, i):
     resp = sock.send({"command": "ping"})
@@ -34,7 +34,7 @@ for i in range(thread_count):
     s.start()
 
 time.sleep(6)
-router.stop_threads()
+router.stop()
 
 
 
