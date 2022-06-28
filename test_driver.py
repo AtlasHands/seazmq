@@ -13,7 +13,7 @@ def start_test(ctx):
             return
         else:
             test_in_progress_event.set()
-            ctx.send("Test Started")
+            ctx.send({"test_status": "started"})
     ctx.publish("test-status", {
         "stage-1": "not started",
         "stage-2": "not started"
@@ -64,7 +64,8 @@ with SeaZMQClient({"conn": "tcp://127.0.0.1:8000"}) as dealer:
 
     client_2.response_event.wait()
     print("client_2", client_2.get_response())
-
+    thing, err = client_2.get_response()
+    print(type(thing))
     client_2.stream_event.wait()
     print("client_2", client_2.get_stream())
     client_3 = dealer.send({"command": "start-test"})

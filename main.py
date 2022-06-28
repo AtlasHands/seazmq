@@ -625,6 +625,11 @@ class SeaZMQResponse:
                         return {}, "timeout"
                     else:
                         return self.data["response"], None
+                else:
+                    return {}, "no response"
+            if self.timed_out is True:
+                return {}, "timeout"
+            return {}, "no data"
 
 
 # simple wrapper for publisher socket that creates an LVC
